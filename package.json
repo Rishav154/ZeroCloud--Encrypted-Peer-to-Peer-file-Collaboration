@@ -1,0 +1,19 @@
+{
+  "name": "zerocloud",
+  "private": true,
+  "packageManager": "pnpm@10.13.1",
+  "scripts": {
+    "dev": "pnpm --filter @zerocloud/shared build && concurrently -k -n web,signal -c cyan,magenta \"pnpm --filter @zerocloud/web dev\" \"pnpm --filter @zerocloud/signal dev\"",
+    "build": "pnpm --filter @zerocloud/shared build && pnpm --filter @zerocloud/signal build && pnpm --filter @zerocloud/web build",
+    "lint": "eslint .",
+    "typecheck": "pnpm --filter @zerocloud/shared typecheck && pnpm --filter @zerocloud/signal typecheck && pnpm --filter @zerocloud/web typecheck",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "eslint": "^9.37.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.0"
+  }
+}
