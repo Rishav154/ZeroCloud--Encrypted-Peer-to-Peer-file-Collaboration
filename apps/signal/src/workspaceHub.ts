@@ -9,6 +9,7 @@ import type { Pool } from "pg";
 import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 import { verifySessionToken } from "./auth/session.js";
+import { logger } from "./logging.js";
 
 type MemberRecord = {
   user_id: string;
@@ -25,6 +26,12 @@ type SocketState = {
   peer: PeerDirectoryEntry | null;
   authTimer: ReturnType<typeof setTimeout>;
   queue: Promise<void>;
+  userSlotAcquired: boolean;
+};
+
+export type UserConnectionLimiter = {
+  acquireUser: (userId: string) => boolean;
+  releaseUser: (userId: string) => void;
 };
 
 export class WorkspaceHub {
@@ -33,6 +40,7 @@ export class WorkspaceHub {
   constructor(
     private readonly pool: Pool,
     private readonly jwtSecret: string,
+    private readonly connectionLimits?: UserConnectionLimiter,
   ) {}
 
   accept(socket: WebSocket): void {
@@ -47,6 +55,7 @@ export class WorkspaceHub {
         socket.close(4401, "Authentication timeout");
       }, 5000),
       queue: Promise.resolve(),
+      userSlotAcquired: false,
     };
     state.authTimer.unref();
     this.log(null, null, `connected:${state.connectionId}`);
@@ -63,6 +72,9 @@ export class WorkspaceHub {
     });
     socket.on("close", () => {
       clearTimeout(state.authTimer);
+      if (state.userSlotAcquired && state.userId) {
+        this.connectionLimits?.releaseUser(state.userId);
+      }
       const wasJoined = Boolean(state.workspaceId && state.peer);
       this.removePeer(state, `disconnect:${state.connectionId}`);
       if (!wasJoined)
@@ -132,6 +144,14 @@ export class WorkspaceHub {
       return;
     }
     const message = parsed.data;
+    if (message.type === "ping") {
+      this.send(state.socket, {
+        type: "pong",
+        ts: message.ts,
+        serverTime: Date.now(),
+      });
+      return;
+    }
     if (message.type === "auth") {
       if (state.userId) {
         this.sendError(
@@ -162,7 +182,13 @@ export class WorkspaceHub {
         state.socket.close(4401, "Unknown account");
         return;
       }
+      if (this.connectionLimits && !this.connectionLimits.acquireUser(userId)) {
+        this.sendError(state, "CONNECTION_LIMIT", "Maximum connections for this account reached");
+        state.socket.close(4429, "Per-user connection limit reached");
+        return;
+      }
       state.userId = userId;
+      state.userSlotAcquired = Boolean(this.connectionLimits);
       clearTimeout(state.authTimer);
       const expiresIn = Math.max(0, expiresAt * 1000 - Date.now());
       state.authTimer = setTimeout(
@@ -181,14 +207,6 @@ export class WorkspaceHub {
         "Authenticate before sending messages",
       );
       state.socket.close(4401, "Authentication required");
-      return;
-    }
-    if (message.type === "ping") {
-      this.send(state.socket, {
-        type: "pong",
-        ts: message.ts,
-        serverTime: Date.now(),
-      });
       return;
     }
     if (message.type === "join") {
@@ -355,8 +373,6 @@ export class WorkspaceHub {
     peerId: string | null,
     event: string,
   ): void {
-    console.info(
-      `[room=${workspaceId ?? "-"}] [peer=${peerId?.slice(0, 8) ?? "-"}] ${event}`,
-    );
+    logger.info({ room: workspaceId, peerId: peerId?.slice(0, 8) ?? null, event }, "websocket event");
   }
 }

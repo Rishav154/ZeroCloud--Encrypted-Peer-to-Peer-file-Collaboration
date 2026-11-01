@@ -4,11 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.json",
+    "dev": "node ../../scripts/write-build-info.mjs && tsx watch src/index.ts",
+    "build": "node ../../scripts/write-build-info.mjs && tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "node ../../scripts/write-build-info.mjs && tsc -p tsconfig.json --noEmit",
     "db:migrate": "tsx src/db/migrate-cli.ts",
+    "db:backup": "tsx src/db/backup.ts",
+    "db:restore": "tsx src/db/restore.ts",
     "test": "vitest run"
   },
   "dependencies": {
@@ -21,6 +23,8 @@
     "helmet": "^8.3.0",
     "jose": "^6.2.14",
     "pg": "^8.16.3",
+    "pino": "^10.4.0",
+    "pino-http": "^11.0.0",
     "ws": "^8.18.3",
     "zod": "^4.1.12"
   },

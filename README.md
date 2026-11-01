@@ -23,7 +23,7 @@ pnpm dev
 
 Open <http://localhost:3000/register> to create an account. Account registration is tied to the identity key in that browser's IndexedDB. Sign in from that same browser profile, then create and open workspaces at <http://localhost:3000/workspaces>. The API and signalling server run on port `4000`.
 
-The required environment values are `DATABASE_URL`, `ALLOWED_ORIGIN`, `WEB_ORIGIN`, and `JWT_SECRET`. `JWT_SECRET` must be at least 32 characters. Set `NEXT_PUBLIC_WEB_ORIGIN` to the browser-visible equivalent of `WEB_ORIGIN` for invite URLs. The browser uses `NEXT_PUBLIC_API_URL` (defaults to `http://localhost:4000/api`). `TEST_DATABASE_URL` must point to the separate `zerocloud_test` database.
+The required local environment values are `DATABASE_URL`, `ALLOWED_ORIGIN`, `WEB_ORIGIN`, and `JWT_SECRET`. `DIRECT_DATABASE_URL` should point to the direct PostgreSQL connection and is used by migrations and backup/restore; locally it can equal `DATABASE_URL`. `JWT_SECRET` must be at least 32 characters. Set `NEXT_PUBLIC_WEB_ORIGIN` to the browser-visible equivalent of `WEB_ORIGIN` for invite URLs. The browser uses `NEXT_PUBLIC_API_URL` (defaults to `http://localhost:4000/api`). `TEST_DATABASE_URL` must point to the separate `zerocloud_test` database.
 
 The Postgres initialization script creates `zerocloud_test` when a new named volume is initialized. Existing volumes do not rerun initialization scripts; if needed, create the test DB once with:
 
@@ -108,7 +108,7 @@ Chat remains protected by WebRTC DTLS and the authenticated transport session on
 
 ## Workspace peer and file-transfer testing
 
-Open a workspace in two authenticated browser profiles, create an invite from the owner profile, and open the link in the second profile. The invite secret appears only after `#`, and the page strips it from the address bar after reading it. Join the workspace from each tab and test chat and direct file transfer. The invitation is single use and expires on its selected schedule; pending invites may be revoked. Configure STUN/TURN with `NEXT_PUBLIC_STUN_URLS`, `NEXT_PUBLIC_TURN_URL`, `NEXT_PUBLIC_TURN_USERNAME`, and `NEXT_PUBLIC_TURN_CREDENTIAL`. Comma-separated TURN URLs share one username and credential. These browser-visible credentials should be intended for client use, such as short-lived TURN credentials.
+Open a workspace in two authenticated browser profiles, create an invite from the owner profile, and open the link in the second profile. The invite secret appears only after `#`, and the page strips it from the address bar after reading it. Join the workspace from each tab and test chat and direct file transfer. The invitation is single use and expires on its selected schedule; pending invites may be revoked. The browser fetches authenticated, short-lived ICE credentials from `/api/ice-servers`; provider and static credentials live only in the signal server environment. `STUN_URLS` configures the server's STUN list. `NEXT_PUBLIC_ICE_URLS` lists only public STUN/TURN URL hosts so the web CSP can allow browser ICE traffic. Do not set any `NEXT_PUBLIC_TURN_*` values.
 
 `NEXT_PUBLIC_FORCE_P256=true` forces a P-256 identity. `NEXT_PUBLIC_DEBUG_WIRE=true` adds ciphertext prefixes and byte counts to the debug panel. `NEXT_PUBLIC_DEBUG_TAMPER=true` flips a bit in the third file chunk during development to exercise integrity failure.
 
@@ -207,3 +207,22 @@ pnpm typecheck
 pnpm lint
 pnpm build
 ```
+
+## Phase 8: deployment and demo preflight
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the Vercel + Render + Neon deployment, secret/public environment table, startup migrations, backups, rollback policy, and troubleshooting. The `/preflight` page checks secure context, browser crypto and storage, signal/health latency, database wake state, ICE candidate types, local identity, and build identifiers. The copyable report contains only status/version information and a shortened identity fingerprint.
+
+```mermaid
+flowchart LR
+  B[Browsers] -->|HTTPS| V[Vercel web app]
+  B -->|HTTPS API and WSS signaling| R[Render signal service]
+  B <-->|WebRTC DataChannel: DTLS| B
+  R -->|pooled queries and direct migrations| N[(Neon PostgreSQL metadata)]
+  R -->|server-side credential API| M[Metered TURN]
+```
+
+The nonce-based Content Security Policy is produced by the Next.js proxy from the configured API origin, HTTPS/WSS signaling origin, and `NEXT_PUBLIC_ICE_URLS` ICE hosts. Pages are dynamically rendered to provide a fresh nonce; this is acceptable for this app. Development permits `unsafe-eval` for the Next dev runtime. Production does not permit inline scripts without the per-request nonce.
+
+`pnpm db:backup` creates a timestamped custom-format dump under `backups/`. `pnpm db:restore -- <file>` asks for the exact word `RESTORE` before replacing objects in the configured direct database. Use a scratch database for restore drills. `pnpm check:client-secrets` builds the web bundle and scans it for server-side env values where available; CI runs this after build.
+
+`pnpm e2e:smoke` runs the single approved two-context browser smoke flow. Its CI job is separate and non-blocking because headless WebRTC can be flaky. If that occurs, run it locally with a started PostgreSQL 16 service and documented local environment; do not treat the e2e result as the CI quality gate.

@@ -44,8 +44,8 @@ function InviteJoin() {
     fragmentCaptured.current = true;
     const fragmentSecret = window.location.hash.slice(1);
     if (fragmentSecret) {
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
       setSecret(fragmentSecret);
-      window.history.replaceState(null, "", window.location.pathname);
     } else {
       setError("Invite link is missing its secret.");
     }

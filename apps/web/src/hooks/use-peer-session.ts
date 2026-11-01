@@ -24,6 +24,7 @@ import { WorkspaceSyncManager } from "../lib/sync/WorkspaceSyncManager";
 import type { SyncTransferOptions } from "../lib/transfer/types";
 import { loadWorkspace } from "../lib/workspaces/api";
 import { workspaceKeyring } from "../lib/workspaces/keyring";
+import { iceServerCache, type IceServerBundle } from "../lib/network/iceServers";
 
 type ActiveSession = { workspaceId: string; peerId: string };
 type IdentityView = {
@@ -54,7 +55,7 @@ export function usePeerSession(
   activeWorkspaceId: string | null;
   isJoined: boolean;
   openPeerCount: number;
-  joinWorkspace: () => void;
+  joinWorkspace: () => Promise<void>;
   leaveWorkspace: () => void;
   sendChat: (text: string) => boolean;
   sendFile: (file: File, peerId: string | "all") => number;
@@ -87,6 +88,7 @@ export function usePeerSession(
   const identityRef = useRef<StoredIdentity | null>(null);
   const verifiedFingerprintsRef = useRef<Set<string>>(new Set());
   const identityPromiseRef = useRef<Promise<void> | null>(null);
+  const iceServersRef = useRef<IceServerBundle | null>(null);
   const [identity, setIdentity] = useState<IdentityView | null>(null);
   const [identityError, setIdentityError] = useState<string | null>(null);
   const setPeerId = usePeerStore((state) => state.setPeerId);
@@ -104,6 +106,30 @@ export function usePeerSession(
   useEffect(() => {
     if (!peerId) setPeerId(crypto.randomUUID());
   }, [peerId, setPeerId]);
+
+  useEffect(() => {
+    if (!accessToken) {
+      iceServersRef.current = null;
+      return;
+    }
+    let current = true;
+    const unsubscribe = iceServerCache.subscribe((bundle) => {
+      if (!current) return;
+      iceServersRef.current = bundle;
+      managerRef.current?.setIceServers(bundle.iceServers);
+    });
+    void iceServerCache.get(accessToken)
+      .then((bundle) => {
+        if (!current) return;
+        iceServersRef.current = bundle;
+        managerRef.current?.setIceServers(bundle.iceServers);
+      })
+      .catch(() => recordEvent("ice-servers-unavailable", "error"));
+    return () => {
+      current = false;
+      unsubscribe();
+    };
+  }, [accessToken]);
 
   useEffect(() => {
     let current = true;
@@ -309,7 +335,7 @@ export function usePeerSession(
   );
   sendRef.current = signal.send;
 
-  const joinWorkspace = useCallback((): void => {
+  const joinWorkspace = useCallback(async (): Promise<void> => {
     if (!peerId) {
       usePeerStore.getState().setError("Peer ID is still being created");
       return;
@@ -326,6 +352,22 @@ export function usePeerSession(
         .setError("Leave the current room before joining another");
       return;
     }
+
+    let iceBundle = iceServersRef.current;
+    if (!iceBundle || iceBundle.expiresAt <= Date.now()) {
+      if (!accessToken) {
+        usePeerStore.getState().setError("Sign in before joining a workspace");
+        return;
+      }
+      try {
+        iceBundle = await iceServerCache.get(accessToken);
+        iceServersRef.current = iceBundle;
+      } catch {
+        usePeerStore.getState().setError("Could not load ICE servers. Retry when the signal server is available.");
+        return;
+      }
+    }
+    if (activeSessionRef.current) return;
 
     const active = { workspaceId, peerId };
     const store = usePeerStore.getState();
@@ -363,6 +405,7 @@ export function usePeerSession(
           return refreshed.currentKeyVersion;
         },
       },
+      iceBundle.iceServers,
     );
     managerRef.current = manager;
     const syncManager = new WorkspaceSyncManager(

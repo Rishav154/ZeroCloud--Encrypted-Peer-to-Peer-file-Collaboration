@@ -7,9 +7,9 @@ import {
   type ServerSignalMessage,
 } from "@zerocloud/shared";
 import { useSignalStore } from "../lib/signal-store";
+import { publicConfig } from "../lib/config";
 
-const signalUrl =
-  process.env.NEXT_PUBLIC_SIGNAL_URL ?? "ws://localhost:4000/ws";
+const signalUrl = publicConfig.NEXT_PUBLIC_SIGNAL_URL;
 
 type SignalSocketHandlers = {
   onMessage: (message: ServerSignalMessage) => void;
@@ -61,6 +61,10 @@ export function useSignalSocket(
         return;
       }
       socketRef.current = socket;
+      let authenticated = false;
+      const wakingTimer = setTimeout(() => {
+        if (socketRef.current === socket && !authenticated) setStatus("waking");
+      }, 3000);
 
       socket.addEventListener("open", () => {
         attemptRef.current = 0;
@@ -79,6 +83,8 @@ export function useSignalSocket(
           return;
         }
         if (parsed.data.type === "authenticated") {
+          authenticated = true;
+          clearTimeout(wakingTimer);
           setStatus("connected");
           handlersRef.current.onOpen();
           return;
@@ -86,6 +92,7 @@ export function useSignalSocket(
         handlersRef.current.onMessage(parsed.data);
       });
       socket.addEventListener("close", () => {
+        clearTimeout(wakingTimer);
         if (socketRef.current === socket) socketRef.current = null;
         scheduleReconnect();
       });

@@ -1,8 +1,8 @@
-import { Pool } from "pg";
 import { config } from "../config.js";
+import { createDatabasePool } from "./pool.js";
 import { migrateDatabase } from "./migrate.js";
 
-const pool = new Pool({ connectionString: config.DATABASE_URL });
+const pool = createDatabasePool(config.DIRECT_DATABASE_URL, { ...config, DB_POOL_MAX: 1 });
 try {
   const applied = await migrateDatabase(pool);
   console.info(

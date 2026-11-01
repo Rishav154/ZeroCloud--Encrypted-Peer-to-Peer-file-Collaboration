@@ -22,6 +22,8 @@ import {
   workspaceIdSchema,
 } from "./workspaces/schemas.js";
 import type { WorkspaceMemberDirectory } from "@zerocloud/shared";
+import type { IceServerService } from "./iceServers.js";
+import { logger } from "./logging.js";
 
 export type ApiConfig = {
   JWT_SECRET: string;
@@ -99,6 +101,10 @@ function failureHandler(
     errorResponse(response, 400, "INVALID_REQUEST", "Request is invalid");
     return;
   }
+  logger.error(
+    { err: error, requestId: response.getHeader("x-request-id") },
+    "api request failed",
+  );
   errorResponse(
     response,
     500,
@@ -111,8 +117,13 @@ export function createApiRouter(
   pool: Pool,
   config: ApiConfig,
   workspaceHub?: WorkspaceHub,
+  iceServerService?: Pick<IceServerService, "get">,
 ): Router {
   const router = Router();
+  router.use((_request, response, next) => {
+    response.setHeader("Cache-Control", "no-store");
+    next();
+  });
   const session = requireSession(config.JWT_SECRET);
   const authLimiter = rateLimit({
     windowMs: 60_000,
@@ -428,6 +439,28 @@ export function createApiRouter(
 
   router.use("/auth", authRouter);
   router.use(session);
+
+  const iceServersLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (request) => {
+      const userId = (request.res?.locals as { authUserId?: unknown } | undefined)?.authUserId;
+      return typeof userId === "string" ? userId : "unauthenticated";
+    },
+  });
+  router.get("/ice-servers", iceServersLimiter, async (_request, response) => {
+    if (!iceServerService) {
+      errorResponse(response, 503, "ICE_UNAVAILABLE", "ICE server configuration is unavailable");
+      return;
+    }
+    try {
+      response.json(await iceServerService.get());
+    } catch {
+      errorResponse(response, 503, "ICE_UNAVAILABLE", "ICE server credentials are temporarily unavailable");
+    }
+  });
 
   router.get("/me", async (request, response) => {
     const result = await pool.query<{

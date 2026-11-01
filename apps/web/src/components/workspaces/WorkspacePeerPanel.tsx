@@ -18,6 +18,7 @@ import type { PeerSnapshot } from "../../lib/webrtc/PeerManager";
 
 const signalStatusStyles = {
   connecting: "bg-amber-400",
+  waking: "bg-amber-400 animate-pulse",
   connected: "bg-emerald-400",
   disconnected: "bg-rose-400",
 } as const;
@@ -182,7 +183,9 @@ export default function WorkspacePeerPanel({
             <span
               className={`h-2 w-2 rounded-full ${signalStatusStyles[signalStatus]}`}
             />
-            <span className="text-zinc-300">Signalling {signalStatus}</span>
+            <span className="text-zinc-300">
+              {signalStatus === "waking" ? "Waking up the server… retrying automatically" : `Signalling ${signalStatus}`}
+            </span>
           </div>
         </header>
 
@@ -660,14 +663,12 @@ export default function WorkspacePeerPanel({
                         )}
                       </div>
                     </div>
-                    <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-zinc-800">
-                      <div
-                        className="h-full rounded-full bg-violet-400 transition-[width]"
-                        style={{
-                          width: `${Math.max(0, Math.min(100, transfer.progress * 100))}%`,
-                        }}
-                      />
-                    </div>
+                    <progress
+                      className="mt-3 h-1.5 w-full accent-violet-400"
+                      value={Math.max(0, Math.min(100, transfer.progress * 100))}
+                      max={100}
+                      aria-label="File transfer progress"
+                    />
                     <div className="mt-2 flex justify-between text-[11px] text-zinc-500">
                       <span>
                         {Math.round(transfer.progress * 100)}%

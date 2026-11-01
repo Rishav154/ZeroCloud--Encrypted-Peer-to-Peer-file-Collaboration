@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: zerocloud
+          POSTGRES_PASSWORD: zerocloud-test-password
+          POSTGRES_DB: zerocloud_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zerocloud -d zerocloud_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://zerocloud:zerocloud-test-password@localhost:5432/zerocloud_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm check:client-secrets
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Report high and critical production advisories
+        run: pnpm audit --prod --audit-level high
+
+  browser-smoke:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: zerocloud
+          POSTGRES_PASSWORD: zerocloud-smoke-password
+          POSTGRES_DB: zerocloud
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zerocloud -d zerocloud"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://zerocloud:zerocloud-smoke-password@localhost:5432/zerocloud
+      DIRECT_DATABASE_URL: postgresql://zerocloud:zerocloud-smoke-password@localhost:5432/zerocloud
+      ALLOWED_ORIGIN: http://localhost:3000
+      WEB_ORIGIN: http://localhost:3000
+      JWT_SECRET: local-smoke-test-secret-with-at-least-32-chars
+      ICE_MODE: static
+      STUN_URLS: stun:stun.l.google.com:19302
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm e2e:smoke

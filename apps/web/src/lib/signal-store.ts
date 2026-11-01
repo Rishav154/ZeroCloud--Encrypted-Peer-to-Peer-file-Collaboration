@@ -1,6 +1,6 @@
 import { create } from "zustand";
 
-export type ConnectionStatus = "connecting" | "connected" | "disconnected";
+export type ConnectionStatus = "connecting" | "waking" | "connected" | "disconnected";
 
 type SignalState = {
   status: ConnectionStatus;

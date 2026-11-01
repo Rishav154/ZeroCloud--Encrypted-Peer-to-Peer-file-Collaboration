@@ -2,9 +2,11 @@ node_modules/
 .next/
 dist/
 coverage/
+backups/
 .turbo/
 .env
 .env.*
 !.env.example
 *.log
 *.tsbuildinfo
+apps/signal/src/build-info.generated.ts

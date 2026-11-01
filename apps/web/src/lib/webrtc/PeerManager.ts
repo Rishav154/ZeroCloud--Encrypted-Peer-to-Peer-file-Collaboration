@@ -148,7 +148,6 @@ export type WorkspaceKeyAccess = {
 type SignalSender = (to: string, data: SignalData) => void;
 type IceSignal = Extract<SignalData, { kind: "ice" }>;
 
-const STUN_FALLBACK = "stun:stun.l.google.com:19302";
 const CHAT_TYPE = "chat";
 const SYNC_TYPE = "sync";
 
@@ -167,37 +166,13 @@ function asRtcIceCandidate(
   };
 }
 
-function configuredIceServers(): RTCIceServer[] {
-  const stunUrls = (process.env.NEXT_PUBLIC_STUN_URLS ?? STUN_FALLBACK)
-    .split(",")
-    .map((url) => url.trim())
-    .filter(Boolean);
-  const servers: RTCIceServer[] = stunUrls.map((urls) => ({ urls }));
-  const turnUrls = (process.env.NEXT_PUBLIC_TURN_URL ?? "")
-    .split(",")
-    .map((url) => url.trim())
-    .filter(Boolean);
-
-  if (turnUrls.length > 0) {
-    const username = process.env.NEXT_PUBLIC_TURN_USERNAME;
-    const credential = process.env.NEXT_PUBLIC_TURN_CREDENTIAL;
-    servers.push({
-      urls: turnUrls,
-      ...(username ? { username } : {}),
-      ...(credential ? { credential } : {}),
-    });
-  }
-
-  return servers;
-}
-
 export class PeerManager {
   readonly events = new TypedEventEmitter<PeerManagerEvents>();
   private readonly peers = new Map<string, PeerRecord>();
   private readonly senders = new Map<string, FileSender>();
   private readonly receivers = new Map<string, FileReceiver>();
   private readonly nextTransferIds = new Map<string, number>();
-  private readonly iceServers = configuredIceServers();
+  private iceServers: RTCIceServer[];
 
   constructor(
     private readonly localPeerId: string,
@@ -206,7 +181,24 @@ export class PeerManager {
     private readonly identity: StoredIdentity,
     private readonly verifiedFingerprints: Set<string>,
     private readonly workspaceKeys: WorkspaceKeyAccess,
-  ) {}
+    iceServers: RTCIceServer[],
+  ) {
+    this.iceServers = iceServers;
+  }
+
+  setIceServers(iceServers: RTCIceServer[]): void {
+    this.iceServers = iceServers;
+    for (const peer of this.peers.values()) {
+      if (peer.disposed) continue;
+      peer.connection.setConfiguration({
+        ...peer.connection.getConfiguration(),
+        iceServers,
+        ...(process.env.NEXT_PUBLIC_FORCE_RELAY === "true"
+          ? { iceTransportPolicy: "relay" as const }
+          : {}),
+      });
+    }
+  }
 
   get peerIds(): string[] {
     return Array.from(this.peers.keys());

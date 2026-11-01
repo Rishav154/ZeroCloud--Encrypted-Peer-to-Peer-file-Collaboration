@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: zerocloud-signal
+    runtime: node
+    rootDir: .
+    buildCommand: corepack pnpm install --frozen-lockfile && corepack pnpm --filter @zerocloud/shared build && corepack pnpm --filter @zerocloud/signal build
+    startCommand: corepack pnpm --filter @zerocloud/signal start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: DATABASE_URL
+        sync: false
+      - key: DIRECT_DATABASE_URL
+        sync: false
+      - key: DATABASE_SSL
+        value: "true"
+      - key: ALLOWED_ORIGIN
+        sync: false
+      - key: WEB_ORIGIN
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ICE_MODE
+        value: provider
+      - key: TURN_APP_NAME
+        sync: false
+      - key: TURN_PROVIDER_SECRET
+        sync: false
+      - key: STUN_URLS
+        value: stun:stun.l.google.com:19302

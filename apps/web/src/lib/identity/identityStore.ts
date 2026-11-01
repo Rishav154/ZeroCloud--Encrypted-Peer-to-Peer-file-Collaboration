@@ -151,6 +151,11 @@ export async function getOrCreateIdentity(
   throw new Error("Timed out preparing the browser identity");
 }
 
+export async function loadExistingIdentity(): Promise<StoredIdentity | null> {
+  const record = await readRecord<IdentityRecord>("identity");
+  return record ? toStoredIdentity(record) : null;
+}
+
 function toStoredIdentity(record: IdentityRecord): StoredIdentity {
   return {
     algorithm: record.algorithm,

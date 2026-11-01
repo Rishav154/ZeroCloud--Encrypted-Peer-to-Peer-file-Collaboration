@@ -457,12 +457,12 @@ export default function FilesTab({
                 {formatSize(usage.used)} / {formatSize(usage.quota)}
               </span>
             </div>
-            <div className="mt-2 h-2 overflow-hidden rounded-full bg-zinc-800">
-              <div
-                className={`h-full ${percentUsed >= 80 ? "bg-amber-400" : "bg-violet-400"}`}
-                style={{ width: `${percentUsed}%` }}
+              <progress
+                className={`mt-2 h-2 w-full accent-violet-400 ${percentUsed >= 80 ? "accent-amber-400" : ""}`}
+                value={percentUsed}
+                max={100}
+                aria-label="Browser storage used"
               />
-            </div>
             {percentUsed >= 80 && (
               <p className="mt-1 text-xs text-amber-300">
                 Browser storage is at least 80% full.

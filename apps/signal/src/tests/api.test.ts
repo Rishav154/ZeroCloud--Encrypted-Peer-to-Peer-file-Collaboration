@@ -1,4 +1,5 @@
 import express from "express";
+import helmet from "helmet";
 import dotenv from "dotenv";
 import { Pool } from "pg";
 import request from "supertest";
@@ -17,6 +18,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createApiRouter } from "../api.js";
 import { migrateDatabase } from "../db/migrate.js";
 import { WorkspaceHub } from "../workspaceHub.js";
+import { createSessionToken } from "../auth/session.js";
+import type { IceServerService } from "../iceServers.js";
 
 dotenv.config({ path: "../../.env" });
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
@@ -905,5 +908,42 @@ describe("authenticated workspace signaling", () => {
       for (const socket of sockets) socket.terminate();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+});
+
+describe("ICE server endpoint", () => {
+  it("includes HTTP security headers on API responses", async () => {
+    const app = express();
+    app.use(helmet());
+    app.use("/api", createApiRouter(pool, testConfig));
+    const response = await request(app).get("/api/ice-servers");
+    expect(response.status).toBe(401);
+    expect(response.headers["x-content-type-options"]).toBe("nosniff");
+    expect(response.headers["x-frame-options"]).toBe("SAMEORIGIN");
+    expect(response.headers["cache-control"]).toBe("no-store");
+  });
+
+  it("requires authentication, disables caching, and enforces 30 requests per user per minute", async () => {
+    const service: Pick<IceServerService, "get"> = {
+      get: async () => ({ iceServers: [{ urls: "turn:example.test", username: "short", credential: "temporary" }], ttlSeconds: 900 }),
+    };
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRouter(pool, testConfig, undefined, service));
+    const client = request(app);
+    const unauthenticated = await client.get("/api/ice-servers");
+    expect(unauthenticated.status).toBe(401);
+    const token = await createSessionToken(crypto.randomUUID(), jwtSecret);
+    const first = await client.get("/api/ice-servers").set("authorization", `Bearer ${token}`);
+    expect(first.status).toBe(200);
+    expect(first.headers["cache-control"]).toBe("no-store");
+    expect(first.body.ttlSeconds).toBe(900);
+    let response = first;
+    for (let index = 1; index < 30; index += 1) {
+      response = await client.get("/api/ice-servers").set("authorization", `Bearer ${token}`);
+    }
+    expect(response.status).toBe(200);
+    const limited = await client.get("/api/ice-servers").set("authorization", `Bearer ${token}`);
+    expect(limited.status).toBe(429);
   });
 });

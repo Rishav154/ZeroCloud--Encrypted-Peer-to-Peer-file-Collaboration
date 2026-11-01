@@ -8,13 +8,18 @@ const migrationDirectory = join(
   "../../migrations",
 );
 
+export const MIGRATION_ADVISORY_LOCK = [73_072_026, 8] as const;
+
 export async function migrateDatabase(
   pool: Pick<Pool, "connect">,
   directory = migrationDirectory,
 ): Promise<string[]> {
   const client = await pool.connect();
   const appliedNow: string[] = [];
+  let locked = false;
   try {
+    await client.query("SELECT pg_advisory_lock($1, $2)", [...MIGRATION_ADVISORY_LOCK]);
+    locked = true;
     await client.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         filename text PRIMARY KEY,
@@ -48,6 +53,12 @@ export async function migrateDatabase(
     }
     return appliedNow;
   } finally {
-    client.release();
+    try {
+      if (locked) {
+        await client.query("SELECT pg_advisory_unlock($1, $2)", [...MIGRATION_ADVISORY_LOCK]);
+      }
+    } finally {
+      client.release();
+    }
   }
 }
