@@ -1,67 +1,102 @@
 "use client";
 
 import { useCallback, useEffect, useRef } from "react";
-import { parseMessage, type PingMessage } from "@zerocloud/shared";
+import {
+  parseServerMessage,
+  type ClientSignalMessage,
+  type ServerSignalMessage,
+} from "@zerocloud/shared";
 import { useSignalStore } from "../lib/signal-store";
 
 const signalUrl =
   process.env.NEXT_PUBLIC_SIGNAL_URL ?? "ws://localhost:4000/ws";
 
-export function useSignalSocket(): { sendPing: () => void } {
+type SignalSocketHandlers = {
+  onMessage: (message: ServerSignalMessage) => void;
+  onOpen: () => void;
+  onDisconnect: () => void;
+  onInvalidMessage: (error: string) => void;
+};
+
+export function useSignalSocket(handlers: SignalSocketHandlers): {
+  send: (message: ClientSignalMessage) => boolean;
+} {
   const socketRef = useRef<WebSocket | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const attemptRef = useRef(0);
-  const pendingPingRef = useRef<number | null>(null);
+  const handlersRef = useRef(handlers);
   const setStatus = useSignalStore((state) => state.setStatus);
-  const setRoundTripMs = useSignalStore((state) => state.setRoundTripMs);
+  handlersRef.current = handlers;
 
   useEffect(() => {
     let stopped = false;
+
+    const scheduleReconnect = (): void => {
+      if (stopped || retryTimerRef.current) return;
+      setStatus("disconnected");
+      handlersRef.current.onDisconnect();
+      const delay = Math.min(1000 * 2 ** attemptRef.current, 15000);
+      attemptRef.current += 1;
+      retryTimerRef.current = setTimeout(() => {
+        retryTimerRef.current = null;
+        connect();
+      }, delay);
+    };
+
     const connect = (): void => {
       if (stopped) return;
       setStatus("connecting");
-      const socket = new WebSocket(signalUrl);
+      let socket: WebSocket;
+      try {
+        socket = new WebSocket(signalUrl);
+      } catch {
+        scheduleReconnect();
+        return;
+      }
       socketRef.current = socket;
+
       socket.addEventListener("open", () => {
         attemptRef.current = 0;
         setStatus("connected");
+        handlersRef.current.onOpen();
       });
-      socket.addEventListener("message", (event: MessageEvent<string>) => {
-        const parsed = parseMessage(event.data);
-        if (parsed.success && parsed.data.type === "pong") {
-          if (pendingPingRef.current === parsed.data.ts) {
-            setRoundTripMs(Date.now() - parsed.data.ts);
-            pendingPingRef.current = null;
-          }
+      socket.addEventListener("message", (event: MessageEvent<unknown>) => {
+        if (typeof event.data !== "string") {
+          handlersRef.current.onInvalidMessage(
+            "Expected a text protocol message",
+          );
+          return;
         }
+        const parsed = parseServerMessage(event.data);
+        if (!parsed.success) {
+          handlersRef.current.onInvalidMessage(parsed.error);
+          return;
+        }
+        handlersRef.current.onMessage(parsed.data);
       });
       socket.addEventListener("close", () => {
         if (socketRef.current === socket) socketRef.current = null;
-        if (stopped) return;
-        setStatus("disconnected");
-        const delay = Math.min(1000 * 2 ** attemptRef.current, 15000);
-        attemptRef.current += 1;
-        retryTimerRef.current = setTimeout(connect, delay);
+        scheduleReconnect();
       });
       socket.addEventListener("error", () => socket.close());
     };
+
     connect();
     return () => {
       stopped = true;
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
       socketRef.current?.close();
       socketRef.current = null;
     };
-  }, [setRoundTripMs, setStatus]);
+  }, [setStatus]);
 
-  const sendPing = useCallback(() => {
+  const send = useCallback((message: ClientSignalMessage): boolean => {
     const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    const message: PingMessage = { type: "ping", ts: Date.now() };
-    pendingPingRef.current = message.ts;
-    setRoundTripMs(null);
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
     socket.send(JSON.stringify(message));
-  }, [setRoundTripMs]);
+    return true;
+  }, []);
 
-  return { sendPing };
+  return { send };
 }
