@@ -16,6 +16,10 @@ export { buildAad, open, seal, type AadContext } from "./seal.js";
 export { AesGcmChunkTransform } from "./chunkCipher.js";
 export {
   generateWorkspaceKey,
+  deriveWorkspaceSyncKey,
+  deriveWorkspaceNameKey,
+  createWorkspaceProofDigest,
+  buildWorkspaceOfferAad,
   sealWorkspaceName,
   openWorkspaceName,
   wrapWorkspaceKey,

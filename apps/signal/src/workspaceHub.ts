@@ -89,13 +89,30 @@ export class WorkspaceHub {
     this.broadcast(workspaceId, { type: "role-changed", userId, role });
   }
 
+  keyRotated(workspaceId: string, version: number, excludeUserId?: string): void {
+    for (const state of this.rooms.get(workspaceId)?.values() ?? []) {
+      if (excludeUserId && state.userId === excludeUserId) continue;
+      this.send(state.socket, { type: "key-rotated", workspaceId, version });
+    }
+  }
+
+  rotationNeeded(workspaceId: string, ownerUserId: string): void {
+    for (const state of this.rooms.get(workspaceId)?.values() ?? []) {
+      if (state.userId !== ownerUserId) continue;
+      this.send(state.socket, { type: "rotation-needed", workspaceId });
+    }
+  }
+
   removeMember(workspaceId: string, userId: string): void {
     const room = this.rooms.get(workspaceId);
     if (!room) return;
-    this.broadcast(workspaceId, { type: "member-removed", userId });
     const removed = Array.from(room.values()).filter(
       (state) => state.peer?.userId === userId,
     );
+    for (const state of room.values()) {
+      if (state.peer?.userId === userId) continue;
+      this.send(state.socket, { type: "member-removed", userId });
+    }
     for (const state of removed) {
       this.send(state.socket, {
         type: "kicked",

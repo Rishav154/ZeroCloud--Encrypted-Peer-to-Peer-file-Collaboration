@@ -7,8 +7,8 @@ import {
 } from "./schemas.js";
 import type { FileEntry } from "./types.js";
 
-export const MAX_SYNC_PARTS = 64;
-export const MAX_SYNC_PLAINTEXT_BYTES = 12_000;
+export const MAX_SYNC_PARTS = 128;
+export const MAX_SYNC_PLAINTEXT_BYTES = 11 * 1024;
 export const MAX_SYNC_DELTA_ENTRIES = 20;
 export const SYNC_REASSEMBLY_TIMEOUT_MS = 30_000;
 export const MAX_SYNC_WIRE_BYTES = 16 * 1024;
@@ -54,6 +54,8 @@ export const syncMessageTypeSchema = z.enum([
   "delta",
   "pull-request",
   "pull-denied",
+  "ws-proof",
+  "stale-key",
 ]);
 
 export const syncHeaderSchema = z
@@ -69,12 +71,19 @@ export const syncHeaderSchema = z
       .max(MAX_SYNC_PARTS - 1),
     totalParts: z.number().int().min(1).max(MAX_SYNC_PARTS),
     seq: z.number().int().min(1).max(0xffffffff),
+    keyVersion: z.number().int().min(1).max(0xffffffff),
   })
   .strict()
   .refine((header) => header.partIndex < header.totalParts, {
     message: "Sync fragment index must be below its total part count",
     path: ["partIndex"],
-  });
+  })
+  .refine((header) => {
+    if (header.messageType === "ws-proof" || header.messageType === "stale-key") {
+      return header.partIndex === 0 && header.totalParts === 1;
+    }
+    return true;
+  }, { message: "Control messages must use a single part", path: ["totalParts"] });
 
 export const syncWireMessageSchema = z
   .object({
@@ -119,8 +128,21 @@ export function buildSyncAad(
     encodeUint32(header.partIndex),
     encodeUint32(header.totalParts),
     encodeUint32(header.seq),
+    encodeUint32(header.keyVersion),
     utf8(senderFingerprint),
     utf8(receiverFingerprint),
+  );
+}
+
+export function buildSyncInnerAad(header: SyncHeader): Uint8Array {
+  return concatBytes(
+    utf8("zerocloud/v1/ws-inner"),
+    utf8(header.workspaceId),
+    encodeUint32(header.keyVersion),
+    utf8(header.messageType),
+    utf8(header.syncId),
+    encodeUint32(header.partIndex),
+    encodeUint32(header.totalParts),
   );
 }
 
@@ -156,7 +178,7 @@ export class SyncReplayGuard {
   private highestSeq = 0;
   private readonly manifestParts = new Map<
     string,
-    { seq: number; totalParts: number; indexes: Set<number> }
+    { seq: number; totalParts: number; keyVersion: number; indexes: Set<number> }
   >();
 
   canAccept(header: SyncHeader): boolean {
@@ -168,6 +190,7 @@ export class SyncReplayGuard {
     return (
       manifest?.seq === header.seq &&
       manifest.totalParts === header.totalParts &&
+      manifest.keyVersion === header.keyVersion &&
       !manifest.indexes.has(header.partIndex)
     );
   }
@@ -183,6 +206,7 @@ export class SyncReplayGuard {
     const manifest = this.manifestParts.get(header.syncId) ?? {
       seq: header.seq,
       totalParts: header.totalParts,
+      keyVersion: header.keyVersion,
       indexes: new Set<number>(),
     };
     manifest.indexes.add(header.partIndex);
@@ -251,7 +275,7 @@ export function fragmentManifest(
   }
   if (current.length || groups.length === 0) groups.push(current);
   if (groups.length > MAX_SYNC_PARTS) {
-    throw new Error("Manifest requires more than 64 sync fragments");
+    throw new Error("Manifest requires more than 128 sync fragments");
   }
 
   const totalParts = groups.length;

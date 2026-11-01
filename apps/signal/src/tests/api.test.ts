@@ -278,7 +278,7 @@ describe("workspace API", () => {
       .set("authorization", `Bearer ${token}`);
     expect(list.status).toBe(200);
     expect(list.body.workspaces).toEqual([
-      { id, nameSealed, currentKeyVersion: 1, role: "owner" },
+      { id, nameSealed, currentKeyVersion: 1, needsRotation: false, role: "owner" },
     ]);
     const detail = await client
       .get(`/api/workspaces/${id}`)
@@ -381,7 +381,8 @@ describe("workspace API", () => {
       .delete(
         `/api/workspaces/${workspaceId}/members/${owner.body.user.id as string}`,
       )
-      .set("authorization", `Bearer ${editor.body.accessToken as string}`);
+      .set("authorization", `Bearer ${editor.body.accessToken as string}`)
+      .send({ newVersion: 2, nameSealed: Buffer.alloc(40, 61).toString("base64"), wrappedKeys: [{ userId: editor.body.user.id as string, wrappedKey: Buffer.alloc(60, 62).toString("base64") }] });
     expect(forbiddenRemove.status).toBe(403);
     const forbiddenRevoke = await client
       .delete(`/api/workspaces/${workspaceId}/invites/${inviteId}`)
@@ -593,7 +594,17 @@ describe("workspace API", () => {
         `/api/workspaces/${workspaceId}/members/${member.body.user.id as string}`,
       )
       .set("authorization", `Bearer ${owner.body.accessToken as string}`);
-    expect(removed.status).toBe(200);
+    expect(removed.status).toBe(400);
+    const preparedRemoval = await client
+      .delete(`/api/workspaces/${workspaceId}/members/${member.body.user.id as string}`)
+      .set("authorization", `Bearer ${owner.body.accessToken as string}`)
+      .send({
+        newVersion: 2,
+        nameSealed: Buffer.alloc(40, 28).toString("base64"),
+        wrappedKeys: [{ userId: owner.body.user.id as string, wrappedKey: Buffer.alloc(60, 29).toString("base64") }],
+      });
+    expect(preparedRemoval.status).toBe(200);
+    expect(preparedRemoval.body.version).toBe(2);
     expect(
       (
         await pool.query(
@@ -609,6 +620,100 @@ describe("workspace API", () => {
           .set("authorization", `Bearer ${member.body.accessToken as string}`)
       ).status,
     ).toBe(404);
+  });
+});
+
+describe("workspace key rotation", () => {
+  it("rotates keys transactionally, serves all versions, and rejects old-version invites", async () => {
+    const client = apiClient();
+    const owner = await register(client, "rotate-owner@example.com");
+    const member = await register(client, "rotate-member@example.com");
+    const workspaceId = crypto.randomUUID();
+    const ownerToken = owner.body.accessToken as string;
+    const memberToken = member.body.accessToken as string;
+    await client.post("/api/workspaces").set("authorization", `Bearer ${ownerToken}`).send({
+      id: workspaceId,
+      nameSealed: Buffer.alloc(40, 41).toString("base64"),
+      wrappedKey: Buffer.alloc(60, 42).toString("base64"),
+    });
+    const staleInviteId = crypto.randomUUID();
+    await client.post(`/api/workspaces/${workspaceId}/invites`).set("authorization", `Bearer ${ownerToken}`).send({
+      inviteId: staleInviteId,
+      role: "editor",
+      wrappedKey: Buffer.alloc(60, 43).toString("base64"),
+      keyVersion: 1,
+    });
+    const rotateBody = {
+      newVersion: 2,
+      nameSealed: Buffer.alloc(40, 44).toString("base64"),
+      wrappedKeys: [
+        { userId: owner.body.user.id as string, wrappedKey: Buffer.alloc(60, 45).toString("base64") },
+      ],
+    };
+    const missingRecipient = await client.post(`/api/workspaces/${workspaceId}/rotate`).set("authorization", `Bearer ${ownerToken}`).send({ ...rotateBody, wrappedKeys: [] });
+    expect(missingRecipient.status).toBe(409);
+    expect(missingRecipient.body.code).toBe("MEMBERS_CHANGED");
+    const unchanged = await client.get(`/api/workspaces/${workspaceId}`).set("authorization", `Bearer ${ownerToken}`);
+    expect(unchanged.body.workspace.currentKeyVersion).toBe(1);
+    const rotated = await client.post(`/api/workspaces/${workspaceId}/rotate`).set("authorization", `Bearer ${ownerToken}`).send(rotateBody);
+    expect(rotated.status).toBe(200);
+    expect(rotated.body).toMatchObject({ version: 2, needsRotation: false });
+    const keys = await client.get(`/api/workspaces/${workspaceId}/keys`).set("authorization", `Bearer ${ownerToken}`);
+    expect(keys.status).toBe(200);
+    expect(keys.body.keys.map((entry: { keyVersion: number }) => entry.keyVersion)).toEqual([1, 2]);
+    const staleAccept = await client.post(`/api/invites/${staleInviteId}/accept`).set("authorization", `Bearer ${memberToken}`).send({ wrappedForSelf: Buffer.alloc(60, 46).toString("base64") });
+    expect(staleAccept.status).toBe(404);
+  });
+
+  it("requires rotation payloads for removal and marks a leaving member for rotation", async () => {
+    const client = apiClient();
+    const owner = await register(client, "leave-owner@example.com");
+    const member = await register(client, "leave-member@example.com");
+    const workspaceId = crypto.randomUUID();
+    const ownerToken = owner.body.accessToken as string;
+    const memberToken = member.body.accessToken as string;
+    await client.post("/api/workspaces").set("authorization", `Bearer ${ownerToken}`).send({
+      id: workspaceId,
+      nameSealed: Buffer.alloc(40, 47).toString("base64"),
+      wrappedKey: Buffer.alloc(60, 48).toString("base64"),
+    });
+    const inviteId = crypto.randomUUID();
+    await client.post(`/api/workspaces/${workspaceId}/invites`).set("authorization", `Bearer ${ownerToken}`).send({
+      inviteId,
+      role: "editor",
+      wrappedKey: Buffer.alloc(60, 49).toString("base64"),
+      keyVersion: 1,
+    });
+    await client.post(`/api/invites/${inviteId}/accept`).set("authorization", `Bearer ${memberToken}`).send({ wrappedForSelf: Buffer.alloc(60, 50).toString("base64") });
+    const left = await client.post(`/api/workspaces/${workspaceId}/leave`).set("authorization", `Bearer ${memberToken}`).send({});
+    expect(left.status).toBe(200);
+    expect(left.body.needsRotation).toBe(true);
+    const detail = await client.get(`/api/workspaces/${workspaceId}`).set("authorization", `Bearer ${ownerToken}`);
+    expect(detail.body.workspace.needsRotation).toBe(true);
+    const noPayload = await client.delete(`/api/workspaces/${workspaceId}/members/${member.body.user.id as string}`).set("authorization", `Bearer ${ownerToken}`);
+    expect(noPayload.status).toBe(400);
+  });
+
+  it("serializes concurrent rotations at one version", async () => {
+    const client = apiClient();
+    const owner = await register(client, "concurrent-rotate@example.com");
+    const token = owner.body.accessToken as string;
+    const workspaceId = crypto.randomUUID();
+    await client.post("/api/workspaces").set("authorization", `Bearer ${token}`).send({
+      id: workspaceId,
+      nameSealed: Buffer.alloc(40, 51).toString("base64"),
+      wrappedKey: Buffer.alloc(60, 52).toString("base64"),
+    });
+    const body = {
+      newVersion: 2,
+      nameSealed: Buffer.alloc(40, 53).toString("base64"),
+      wrappedKeys: [{ userId: owner.body.user.id as string, wrappedKey: Buffer.alloc(60, 54).toString("base64") }],
+    };
+    const results = await Promise.all([
+      client.post(`/api/workspaces/${workspaceId}/rotate`).set("authorization", `Bearer ${token}`).send(body),
+      client.post(`/api/workspaces/${workspaceId}/rotate`).set("authorization", `Bearer ${token}`).send(body),
+    ]);
+    expect(results.map((result) => result.status).sort()).toEqual([200, 409]);
   });
 });
 
@@ -766,7 +871,6 @@ describe("authenticated workspace signaling", () => {
         code: "NOT_A_MEMBER",
       });
 
-      const memberRemoved = nextSocketMessage(memberSocket, "member-removed");
       const memberKicked = nextSocketMessage(memberSocket, "kicked");
       const ownerMemberRemoved = nextSocketMessage(
         ownerSocket,
@@ -777,9 +881,9 @@ describe("authenticated workspace signaling", () => {
         .delete(
           `/api/workspaces/${firstWorkspaceId}/members/${member.body.user.id as string}`,
         )
-        .set("authorization", `Bearer ${ownerToken}`);
+        .set("authorization", `Bearer ${ownerToken}`)
+        .send({ newVersion: 2, nameSealed: Buffer.alloc(40, 63).toString("base64"), wrappedKeys: [{ userId: owner.body.user.id as string, wrappedKey: Buffer.alloc(60, 64).toString("base64") }] });
       expect(removal.status).toBe(200);
-      expect((await memberRemoved).type).toBe("member-removed");
       expect((await memberKicked).type).toBe("kicked");
       expect((await ownerMemberRemoved).type).toBe("member-removed");
       expect((await ownerPeerLeft).type).toBe("peer-left");

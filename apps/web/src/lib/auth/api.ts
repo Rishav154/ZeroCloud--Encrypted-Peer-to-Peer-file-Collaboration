@@ -29,6 +29,7 @@ export class ApiError extends Error {
     message: string,
     readonly code: string,
     readonly status: number,
+    readonly details?: unknown,
   ) {
     super(message);
     this.name = "ApiError";
@@ -77,6 +78,7 @@ async function request<T>(
       error.success ? error.data.error.message : "Request failed",
       error.success ? error.data.error.code : "REQUEST_FAILED",
       response.status,
+      payload,
     );
   }
   const parsed = schema.safeParse(payload);

@@ -19,8 +19,11 @@ import {
 } from "../lib/identity/identityStore";
 import { useSignalSocket } from "./use-signal-socket";
 import { useAuthStore } from "../lib/auth/session";
+import { ApiError as WorkspaceApiError } from "../lib/auth/api";
 import { WorkspaceSyncManager } from "../lib/sync/WorkspaceSyncManager";
 import type { SyncTransferOptions } from "../lib/transfer/types";
+import { loadWorkspace } from "../lib/workspaces/api";
+import { workspaceKeyring } from "../lib/workspaces/keyring";
 
 type ActiveSession = { workspaceId: string; peerId: string };
 type IdentityView = {
@@ -202,9 +205,10 @@ export function usePeerSession(
           .filter((peer) => peer.userId === message.userId)
           .map((peer) => peer.peerId);
         store.removeMember(message.userId);
+        manager?.markMemberRemoved(message.userId);
         for (const departedPeerId of departedPeers) {
-          manager?.removePeer(departedPeerId);
-          store.removePeer(departedPeerId);
+          const snapshot = usePeerStore.getState().peers[departedPeerId];
+          if (snapshot) syncManagerRef.current?.peerState(departedPeerId, snapshot.handshakeState, snapshot.role, false);
         }
         recordEvent("member-removed");
         return;
@@ -215,7 +219,35 @@ export function usePeerSession(
         recordEvent(`role-changed:${message.role}`);
         return;
       }
+      if (message.type === "key-rotated") {
+        managerRef.current?.workspaceRotationAnnounced(message.version);
+        const session = useAuthStore.getState();
+        if (session.accessToken && session.user && message.workspaceId === activeSessionRef.current?.workspaceId) {
+          void loadWorkspace(session.accessToken, session.user, message.workspaceId)
+            .then((workspace) => {
+              managerRef.current?.workspaceKeyUpdated();
+              window.dispatchEvent(new CustomEvent("zerocloud:workspace-updated", { detail: workspace }));
+            })
+            .catch((error: unknown) => {
+              if (error instanceof WorkspaceApiError && error.status === 404) managerRef.current?.workspaceAccessLost();
+              recordEvent("workspace-key-refresh-failed", "error");
+            });
+        }
+        recordEvent(`workspace-key-rotated:${message.version}`);
+        return;
+      }
+      if (message.type === "rotation-needed") {
+        window.dispatchEvent(new CustomEvent("zerocloud:rotation-needed", { detail: message.workspaceId }));
+        recordEvent("workspace-rotation-needed", "error");
+        return;
+      }
       if (message.type === "kicked") {
+        if (process.env.NEXT_PUBLIC_DEBUG_IGNORE_KICK === "true") {
+          recordEvent("debug-kick-ignored", "error");
+          return;
+        }
+        workspaceKeyring.clearWorkspace(message.workspaceId);
+        window.dispatchEvent(new CustomEvent("zerocloud:workspace-kicked", { detail: message.workspaceId }));
         activeSessionRef.current = null;
         teardownManager();
         store.resetSession();
@@ -250,6 +282,10 @@ export function usePeerSession(
   }, []);
 
   const handleDisconnect = useCallback((): void => {
+    if (process.env.NEXT_PUBLIC_DEBUG_IGNORE_KICK === "true") {
+      recordEvent("debug-signalling-close-ignored");
+      return;
+    }
     managerRef.current?.closeAll();
     const store = usePeerStore.getState();
     store.clearPeers();
@@ -313,6 +349,20 @@ export function usePeerSession(
       },
       identityRef.current,
       verifiedFingerprintsRef.current,
+      {
+        currentVersion: () => workspaceKeyring.currentVersion(workspaceId),
+        get: (version) => workspaceKeyring.get(workspaceId, version),
+        refresh: async () => {
+          if (process.env.NEXT_PUBLIC_DEBUG_BLOCK_KEYFETCH === "true") {
+            throw new Error("Debug key fetch is blocked");
+          }
+          if (!accessToken || !user) throw new Error("Sign in again to refresh workspace keys");
+          const refreshed = await loadWorkspace(accessToken, user, workspaceId);
+          managerRef.current?.workspaceKeyUpdated();
+          window.dispatchEvent(new CustomEvent("zerocloud:workspace-updated", { detail: refreshed }));
+          return refreshed.currentKeyVersion;
+        },
+      },
     );
     managerRef.current = manager;
     const syncManager = new WorkspaceSyncManager(
@@ -334,6 +384,8 @@ export function usePeerSession(
           const snapshot = usePeerStore.getState().peers[remotePeerId];
           return (
             snapshot?.handshakeState === "secure" &&
+            snapshot.workspaceState === "verified" &&
+            snapshot.workspaceVerifiedVersion === workspaceKeyring.currentVersion(workspaceId) &&
             snapshot.dataChannelState === "open" &&
             snapshot.role !== null
           );
@@ -356,7 +408,7 @@ export function usePeerSession(
     managerUnsubscribeRef.current = [
       manager.events.on("state", (state) => {
         usePeerStore.getState().setPeer(state);
-        syncManager.peerState(state.peerId, state.handshakeState, state.role);
+        syncManager.peerState(state.peerId, state.handshakeState, state.role, state.workspaceState === "verified");
       }),
       manager.events.on("removed", ({ peerId: removedPeerId }) => {
         syncManager.peerRemoved(removedPeerId);
@@ -427,7 +479,7 @@ export function usePeerSession(
     } else {
       recordEvent(`workspace-join-sent:${active.workspaceId}`);
     }
-  }, [peerId, user, workspaceId]);
+  }, [accessToken, peerId, user, workspaceId]);
 
   const leaveWorkspace = useCallback((): void => {
     if (activeSessionRef.current) {
@@ -582,6 +634,9 @@ export function usePeerSession(
   useEffect(() => {
     const onPageHide = (): void => {
       if (activeSessionRef.current) sendRef.current({ type: "leave" });
+      if (activeSessionRef.current) {
+        workspaceKeyring.clearWorkspace(activeSessionRef.current.workspaceId);
+      }
       activeSessionRef.current = null;
       teardownManager();
     };

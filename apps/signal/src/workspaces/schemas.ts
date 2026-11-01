@@ -27,3 +27,22 @@ export const acceptInviteBodySchema = z.object({
 export const updateMemberRoleBodySchema = z.object({
   role: z.enum(["editor", "viewer"]),
 });
+
+const rotationFieldsSchema = z.object({
+  newVersion: z.number().int().min(1).max(0xffffffff),
+  nameSealed: base64Envelope.min(40).max(20_000),
+  wrappedKeys: z
+    .array(
+      z.object({
+        userId: z.string().uuid(),
+        wrappedKey: base64Envelope.min(80).max(4096),
+      }),
+    )
+    .max(500),
+});
+
+export const rotateWorkspaceBodySchema = rotationFieldsSchema.extend({
+  removeUserId: z.string().uuid().optional(),
+});
+
+export const removeMemberWithRotationBodySchema = rotationFieldsSchema;

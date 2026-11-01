@@ -117,6 +117,17 @@ export const memberRemovedSchema = z.object({
   userId: userIdSchema,
 });
 
+export const keyRotatedSchema = z.object({
+  type: z.literal("key-rotated"),
+  workspaceId: workspaceIdSchema,
+  version: z.number().int().positive(),
+});
+
+export const rotationNeededSchema = z.object({
+  type: z.literal("rotation-needed"),
+  workspaceId: workspaceIdSchema,
+});
+
 export const roleChangedSchema = z.object({
   type: z.literal("role-changed"),
   userId: userIdSchema,
@@ -144,6 +155,8 @@ export const serverMessageSchema = z.union([
   forwardedSignalSchema,
   memberAddedSchema,
   memberRemovedSchema,
+  keyRotatedSchema,
+  rotationNeededSchema,
   roleChangedSchema,
   kickedSchema,
   errorMessageSchema,
@@ -159,6 +172,13 @@ export const chatMessageSchema = z.object({
   text: z.string().max(4000),
   ts: z.number(),
 });
+
+export const syncFileOfferSchema = z.object({
+  type: z.literal("sync-file-offer"),
+  keyVersion: z.number().int().min(1).max(0xffffffff),
+  transferId: z.number().int().min(1).max(0xffffffff),
+  sealed: z.string().min(24),
+}).strict();
 
 export const MAX_FILE_SIZE = 500 * 1024 * 1024;
 export const FILE_CHUNK_SIZE = 16 * 1024;
@@ -332,6 +352,7 @@ export type ClientSignalMessage = z.infer<typeof clientMessageSchema>;
 export type ServerSignalMessage = z.infer<typeof serverMessageSchema>;
 export type SignalMessage = z.infer<typeof signalMessageSchema>;
 export type ChatMessage = z.infer<typeof chatMessageSchema>;
+export type SyncFileOffer = z.infer<typeof syncFileOfferSchema>;
 export type PeerDirectoryEntry = z.infer<typeof peerDirectoryEntrySchema>;
 export type WorkspaceMemberDirectory = z.infer<
   typeof workspaceMemberDirectorySchema

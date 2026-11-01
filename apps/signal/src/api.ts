@@ -16,6 +16,8 @@ import {
   acceptInviteBodySchema,
   createInviteBodySchema,
   createWorkspaceBodySchema,
+  rotateWorkspaceBodySchema,
+  removeMemberWithRotationBodySchema,
   updateMemberRoleBodySchema,
   workspaceIdSchema,
 } from "./workspaces/schemas.js";
@@ -129,6 +131,183 @@ export function createApiRouter(
 
   const authRouter = Router();
   authRouter.use(authLimiter);
+
+  type RotationMember = {
+    user_id: string;
+    display_name: string;
+    role: "owner" | "editor" | "viewer";
+    fingerprint: string;
+    public_key: Buffer;
+    key_alg: "X25519" | "P-256";
+  };
+  type RotationOutcome =
+    | { kind: "ok"; version: number }
+    | { kind: "members-changed"; members: RotationMember[] }
+    | { kind: "error"; status: number; code: string; message: string };
+
+  async function rotateWorkspace(
+    workspaceId: string,
+    actorId: string,
+    body: z.infer<typeof rotateWorkspaceBodySchema>,
+    removeUserId: string | undefined,
+  ): Promise<RotationOutcome> {
+    const client = await pool.connect();
+    let committedVersion: number | null = null;
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query<{
+        current_key_version: number;
+        owner_id: string;
+        role: string | null;
+      }>(
+        `SELECT w.current_key_version, w.owner_id, m.role
+         FROM workspaces w
+         LEFT JOIN workspace_members m ON m.workspace_id = w.id AND m.user_id = $2
+         WHERE w.id = $1
+         FOR UPDATE OF w`,
+        [workspaceId, actorId],
+      );
+      const workspace = locked.rows[0];
+      if (!workspace || !workspace.role) {
+        await client.query("ROLLBACK");
+        return {
+          kind: "error",
+          status: 404,
+          code: "NOT_FOUND",
+          message: "Workspace not found",
+        };
+      }
+      if (workspace.role !== "owner") {
+        await client.query("ROLLBACK");
+        return {
+          kind: "error",
+          status: 403,
+          code: "FORBIDDEN",
+          message: "Only the workspace owner can rotate the key",
+        };
+      }
+      if (removeUserId === workspace.owner_id) {
+        await client.query("ROLLBACK");
+        return {
+          kind: "error",
+          status: 409,
+          code: "OWNER_CANNOT_BE_REMOVED",
+          message: "The workspace owner cannot be removed",
+        };
+      }
+      if (body.newVersion !== workspace.current_key_version + 1) {
+        await client.query("ROLLBACK");
+        return {
+          kind: "error",
+          status: 409,
+          code: "KEY_VERSION_MISMATCH",
+          message: "The new key version must increment the current version",
+        };
+      }
+      const currentMembers = await client.query<RotationMember>(
+        `SELECT u.id AS user_id, u.display_name, m.role, u.fingerprint,
+                u.public_key, u.key_alg
+         FROM workspace_members m JOIN users u ON u.id = m.user_id
+         WHERE m.workspace_id = $1
+         ORDER BY m.joined_at, u.display_name`,
+        [workspaceId],
+      );
+      const members = currentMembers.rows;
+      if (
+        removeUserId &&
+        !members.some((member) => member.user_id === removeUserId)
+      ) {
+        await client.query("ROLLBACK");
+        return {
+          kind: "error",
+          status: 404,
+          code: "NOT_FOUND",
+          message: "Workspace member not found",
+        };
+      }
+      const expectedIds = members
+        .filter((member) => member.user_id !== removeUserId)
+        .map((member) => member.user_id);
+      const actualIds = body.wrappedKeys.map((entry) => entry.userId);
+      const actualSet = new Set(actualIds);
+      if (
+        actualIds.length !== expectedIds.length ||
+        actualSet.size !== actualIds.length ||
+        expectedIds.some((id) => !actualSet.has(id))
+      ) {
+        await client.query("ROLLBACK");
+        return { kind: "members-changed", members };
+      }
+
+      if (removeUserId) {
+        await client.query(
+          "DELETE FROM workspace_keys WHERE workspace_id = $1 AND user_id = $2",
+          [workspaceId, removeUserId],
+        );
+        await client.query(
+          "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+          [workspaceId, removeUserId],
+        );
+      }
+      for (const wrapped of body.wrappedKeys) {
+        await client.query(
+          `INSERT INTO workspace_keys
+             (workspace_id, user_id, key_version, wrapped_key, wrapper_user_id)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [workspaceId, wrapped.userId, body.newVersion, wrapped.wrappedKey, actorId],
+        );
+      }
+      await client.query(
+        `UPDATE workspaces
+         SET current_key_version = $2, name_sealed = $3, needs_rotation = false
+         WHERE id = $1`,
+        [workspaceId, body.newVersion, body.nameSealed],
+      );
+      await client.query(
+        `UPDATE invites SET revoked_at = now()
+         WHERE workspace_id = $1 AND used_at IS NULL AND revoked_at IS NULL`,
+        [workspaceId],
+      );
+      await client.query("COMMIT");
+      committedVersion = body.newVersion;
+      return { kind: "ok", version: committedVersion };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  function sendRotationOutcome(
+    response: Response,
+    outcome: RotationOutcome,
+    workspaceId: string,
+    removeUserId?: string,
+  ): void {
+    if (outcome.kind === "error") {
+      errorResponse(response, outcome.status, outcome.code, outcome.message);
+      return;
+    }
+    if (outcome.kind === "members-changed") {
+      response.status(409).json({
+        code: "MEMBERS_CHANGED",
+        message: "The workspace membership changed during key rotation",
+        members: outcome.members.map((member) => ({
+          userId: member.user_id,
+          displayName: member.display_name,
+          role: member.role,
+          fingerprint: member.fingerprint,
+          publicKey: member.public_key.toString("base64"),
+          keyAlg: member.key_alg,
+        })),
+      });
+      return;
+    }
+    workspaceHub?.keyRotated(workspaceId, outcome.version);
+    if (removeUserId) workspaceHub?.removeMember(workspaceId, removeUserId);
+    response.json({ version: outcome.version, needsRotation: false });
+  }
 
   authRouter.post("/register", async (request, response) => {
     const body = validatedBody(registerBodySchema, request, response);
@@ -324,7 +503,7 @@ export function createApiRouter(
 
   router.get("/workspaces", async (request, response) => {
     const result = await pool.query(
-      `SELECT w.id, w.name_sealed, w.current_key_version, m.role
+      `SELECT w.id, w.name_sealed, w.current_key_version, w.needs_rotation, m.role
        FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id
        WHERE m.user_id = $1 ORDER BY w.created_at DESC`,
       [authenticatedUserId(response)],
@@ -334,6 +513,7 @@ export function createApiRouter(
         id: row.id,
         nameSealed: row.name_sealed,
         currentKeyVersion: row.current_key_version,
+        needsRotation: row.needs_rotation,
         role: row.role,
       })),
     });
@@ -354,11 +534,12 @@ export function createApiRouter(
       id: string;
       name_sealed: string;
       current_key_version: number;
+      needs_rotation: boolean;
       role: string;
       wrapped_key: string | null;
       wrapper_user_id: string | null;
     }>(
-      `SELECT w.id, w.name_sealed, w.current_key_version, m.role, k.wrapped_key, k.wrapper_user_id
+      `SELECT w.id, w.name_sealed, w.current_key_version, w.needs_rotation, m.role, k.wrapped_key, k.wrapper_user_id
        FROM workspaces w
        JOIN workspace_members m ON m.workspace_id = w.id AND m.user_id = $2
        LEFT JOIN workspace_keys k ON k.workspace_id = w.id AND k.user_id = m.user_id AND k.key_version = w.current_key_version
@@ -385,8 +566,9 @@ export function createApiRouter(
       role: string;
       fingerprint: string;
       public_key: Buffer;
+      key_alg: "X25519" | "P-256";
     }>(
-      `SELECT u.id, u.display_name, m.role, u.fingerprint, u.public_key
+      `SELECT u.id, u.display_name, m.role, u.fingerprint, u.public_key, u.key_alg
        FROM workspace_members m JOIN users u ON u.id = m.user_id
        WHERE m.workspace_id = $1 ORDER BY m.joined_at, u.display_name`,
       [parsedId.data],
@@ -396,6 +578,7 @@ export function createApiRouter(
         id: workspace.id,
         nameSealed: workspace.name_sealed,
         currentKeyVersion: workspace.current_key_version,
+        needsRotation: workspace.needs_rotation,
         role: workspace.role,
         wrappedKey: workspace.wrapped_key,
         wrapperUserId: workspace.wrapper_user_id,
@@ -406,8 +589,85 @@ export function createApiRouter(
         role: member.role,
         fingerprint: member.fingerprint,
         publicKey: member.public_key.toString("base64"),
+        keyAlg: member.key_alg,
       })),
     });
+  });
+
+  router.get("/workspaces/:id/keys", async (request, response) => {
+    const workspaceId = workspaceIdSchema.safeParse(request.params.id);
+    if (!workspaceId.success) {
+      errorResponse(response, 400, "INVALID_REQUEST", "Workspace ID is invalid");
+      return;
+    }
+    const userId = authenticatedUserId(response);
+    const result = await pool.query<{
+      current_key_version: number;
+      name_sealed: string;
+      key_version: number;
+      wrapped_key: string;
+      wrapper_user_id: string;
+      wrapper_public_key: Buffer;
+      wrapper_fingerprint: string;
+      wrapper_key_alg: "X25519" | "P-256";
+    }>(
+      `SELECT w.current_key_version, w.name_sealed, k.key_version, k.wrapped_key,
+              k.wrapper_user_id, u.public_key AS wrapper_public_key,
+              u.fingerprint AS wrapper_fingerprint, u.key_alg AS wrapper_key_alg
+       FROM workspaces w
+       JOIN workspace_members m ON m.workspace_id = w.id AND m.user_id = $2
+       JOIN workspace_keys k ON k.workspace_id = w.id AND k.user_id = $2
+       JOIN users u ON u.id = k.wrapper_user_id
+       WHERE w.id = $1 ORDER BY k.key_version`,
+      [workspaceId.data, userId],
+    );
+    if (result.rowCount === 0) {
+      const member = await pool.query(
+        "SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+        [workspaceId.data, userId],
+      );
+      if (!member.rowCount) {
+        errorResponse(response, 404, "NOT_FOUND", "Workspace not found");
+        return;
+      }
+      errorResponse(response, 409, "KEY_UNAVAILABLE", "Workspace keys are unavailable");
+      return;
+    }
+    const first = result.rows[0];
+    if (!first) {
+      errorResponse(response, 409, "KEY_UNAVAILABLE", "Workspace keys are unavailable");
+      return;
+    }
+    response.json({
+      workspaceId: workspaceId.data,
+      currentKeyVersion: first.current_key_version,
+      nameSealed: first.name_sealed,
+      keys: result.rows.map((row) => ({
+        keyVersion: row.key_version,
+        wrappedKey: row.wrapped_key,
+        wrapperUserId: row.wrapper_user_id,
+        wrapperPublicKey: row.wrapper_public_key.toString("base64"),
+        wrapperFingerprint: row.wrapper_fingerprint,
+        wrapperKeyAlg: row.wrapper_key_alg,
+      })),
+    });
+  });
+
+  router.post("/workspaces/:id/rotate", async (request, response) => {
+    const workspaceId = workspaceIdSchema.safeParse(request.params.id);
+    const body = validatedBody(rotateWorkspaceBodySchema, request, response);
+    if (!workspaceId.success) {
+      errorResponse(response, 400, "INVALID_REQUEST", "Workspace ID is invalid");
+      return;
+    }
+    if (!body) return;
+    const outcome = await rotateWorkspace(
+      workspaceId.data,
+      authenticatedUserId(response),
+      body,
+      body.removeUserId,
+    );
+    sendRotationOutcome(response, outcome, workspaceId.data, body.removeUserId);
   });
 
   router.post("/workspaces/:id/invites", async (request, response) => {
@@ -424,55 +684,49 @@ export function createApiRouter(
     }
     if (!body) return;
     const userId = authenticatedUserId(response);
-    const membership = await pool.query<{ role: string }>(
-      "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
-      [parsedId.data, userId],
-    );
-    if (!membership.rows[0]) {
-      errorResponse(response, 404, "NOT_FOUND", "Workspace not found");
-      return;
-    }
-    if (membership.rows[0].role !== "owner") {
-      errorResponse(
-        response,
-        403,
-        "FORBIDDEN",
-        "Only the workspace owner can create invites",
-      );
-      return;
-    }
-    const workspace = await pool.query<{ current_key_version: number }>(
-      "SELECT current_key_version FROM workspaces WHERE id = $1",
-      [parsedId.data],
-    );
-    if (workspace.rows[0]?.current_key_version !== body.keyVersion) {
-      errorResponse(
-        response,
-        409,
-        "KEY_VERSION_MISMATCH",
-        "Invite key version is no longer current",
-      );
-      return;
-    }
     const expiresAt = new Date(
       Date.now() +
         { "1h": 3_600_000, "24h": 86_400_000, "7d": 604_800_000 }[
           body.expiresIn
         ],
     );
-    await pool.query(
-      `INSERT INTO invites (id, workspace_id, created_by, role, wrapped_key, key_version, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [
-        body.inviteId,
-        parsedId.data,
-        userId,
-        body.role,
-        body.wrappedKey,
-        body.keyVersion,
-        expiresAt,
-      ],
-    );
+    const inviteClient = await pool.connect();
+    try {
+      await inviteClient.query("BEGIN");
+      const locked = await inviteClient.query<{ role: string; current_key_version: number }>(
+        `SELECT m.role, w.current_key_version FROM workspaces w
+         LEFT JOIN workspace_members m ON m.workspace_id = w.id AND m.user_id = $2
+         WHERE w.id = $1 FOR UPDATE OF w`,
+        [parsedId.data, userId],
+      );
+      const record = locked.rows[0];
+      if (!record) {
+        await inviteClient.query("ROLLBACK");
+        errorResponse(response, 404, "NOT_FOUND", "Workspace not found");
+        return;
+      }
+      if (record.role !== "owner") {
+        await inviteClient.query("ROLLBACK");
+        errorResponse(response, record.role ? 403 : 404, record.role ? "FORBIDDEN" : "NOT_FOUND", record.role ? "Only the workspace owner can create invites" : "Workspace not found");
+        return;
+      }
+      if (record.current_key_version !== body.keyVersion) {
+        await inviteClient.query("ROLLBACK");
+        errorResponse(response, 409, "KEY_VERSION_MISMATCH", "Invite key version is no longer current");
+        return;
+      }
+      await inviteClient.query(
+        `INSERT INTO invites (id, workspace_id, created_by, role, wrapped_key, key_version, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [body.inviteId, parsedId.data, userId, body.role, body.wrappedKey, body.keyVersion, expiresAt],
+      );
+      await inviteClient.query("COMMIT");
+    } catch (error) {
+      await inviteClient.query("ROLLBACK");
+      throw error;
+    } finally {
+      inviteClient.release();
+    }
     response.status(201).json({
       invite: {
         inviteId: body.inviteId,
@@ -637,6 +891,20 @@ export function createApiRouter(
     let acceptedRole: "editor" | "viewer" = "viewer";
     try {
       await client.query("BEGIN");
+      const inviteWorkspace = await client.query<{ workspace_id: string }>(
+        "SELECT workspace_id FROM invites WHERE id = $1",
+        [inviteId.data],
+      );
+      if (!inviteWorkspace.rows[0]) {
+        await client.query("ROLLBACK");
+        errorResponse(response, 404, "NOT_FOUND", "Invite is invalid or expired");
+        return;
+      }
+      const lockedWorkspace = await client.query<{ current_key_version: number }>(
+        "SELECT current_key_version FROM workspaces WHERE id = $1 FOR UPDATE",
+        [inviteWorkspace.rows[0].workspace_id],
+      );
+      const currentVersion = lockedWorkspace.rows[0]?.current_key_version;
       const lockedInvite = await client.query<{
         workspace_id: string;
         role: "editor" | "viewer";
@@ -661,6 +929,11 @@ export function createApiRouter(
         return;
       }
       workspaceId = invite.workspace_id;
+      if (invite.key_version !== currentVersion) {
+        await client.query("ROLLBACK");
+        errorResponse(response, 409, "STALE_INVITE_VERSION", "This invite uses an outdated workspace key");
+        return;
+      }
       acceptedRole = invite.role;
       const existingMember = await client.query(
         "SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
@@ -804,63 +1077,61 @@ export function createApiRouter(
         );
         return;
       }
-      const userId = authenticatedUserId(response);
-      const owner = await pool.query<{ role: string }>(
-        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+      const body = validatedBody(removeMemberWithRotationBodySchema, request, response);
+      if (!body) return;
+      const outcome = await rotateWorkspace(
+        workspaceId.data,
+        authenticatedUserId(response),
+        body,
+        targetUserId.data,
+      );
+      sendRotationOutcome(response, outcome, workspaceId.data, targetUserId.data);
+    },
+  );
+
+  router.post("/workspaces/:id/leave", async (request, response) => {
+    const workspaceId = workspaceIdSchema.safeParse(request.params.id);
+    if (!workspaceId.success) {
+      errorResponse(response, 400, "INVALID_REQUEST", "Workspace ID is invalid");
+      return;
+    }
+    const userId = authenticatedUserId(response);
+    const client = await pool.connect();
+    let ownerId: string | null = null;
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query<{ owner_id: string; role: string | null }>(
+        `SELECT w.owner_id, m.role FROM workspaces w
+         LEFT JOIN workspace_members m ON m.workspace_id = w.id AND m.user_id = $2
+         WHERE w.id = $1 FOR UPDATE OF w`,
         [workspaceId.data, userId],
       );
-      if (!owner.rows[0]) {
+      const record = locked.rows[0];
+      if (!record || !record.role) {
+        await client.query("ROLLBACK");
         errorResponse(response, 404, "NOT_FOUND", "Workspace not found");
         return;
       }
-      if (owner.rows[0].role !== "owner") {
-        errorResponse(
-          response,
-          403,
-          "FORBIDDEN",
-          "Only the workspace owner can remove members",
-        );
-        return;
-      }
-      const target = await pool.query<{ role: string }>(
-        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
-        [workspaceId.data, targetUserId.data],
-      );
-      if (!target.rows[0]) {
-        errorResponse(response, 404, "NOT_FOUND", "Workspace member not found");
-        return;
-      }
-      if (target.rows[0].role === "owner") {
-        errorResponse(
-          response,
-          409,
-          "OWNER_CANNOT_BE_REMOVED",
-          "The workspace owner cannot be removed",
-        );
-        return;
-      }
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        await client.query(
-          "DELETE FROM workspace_keys WHERE workspace_id = $1 AND user_id = $2",
-          [workspaceId.data, targetUserId.data],
-        );
-        await client.query(
-          "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
-          [workspaceId.data, targetUserId.data],
-        );
-        await client.query("COMMIT");
-      } catch (error) {
+      if (record.role === "owner") {
         await client.query("ROLLBACK");
-        throw error;
-      } finally {
-        client.release();
+        errorResponse(response, 403, "OWNER_CANNOT_LEAVE", "The owner cannot leave the workspace");
+        return;
       }
-      workspaceHub?.removeMember(workspaceId.data, targetUserId.data);
-      response.json({ removed: true });
-    },
-  );
+      ownerId = record.owner_id;
+      await client.query("DELETE FROM workspace_keys WHERE workspace_id = $1 AND user_id = $2", [workspaceId.data, userId]);
+      await client.query("DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2", [workspaceId.data, userId]);
+      await client.query("UPDATE workspaces SET needs_rotation = true WHERE id = $1", [workspaceId.data]);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    workspaceHub?.removeMember(workspaceId.data, userId);
+    if (ownerId) workspaceHub?.rotationNeeded(workspaceId.data, ownerId);
+    response.json({ left: true, needsRotation: true });
+  });
 
   router.use((_request, response) => {
     errorResponse(response, 404, "NOT_FOUND", "API route not found");

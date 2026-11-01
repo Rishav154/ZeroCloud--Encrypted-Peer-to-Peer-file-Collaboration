@@ -318,3 +318,80 @@ Manifest reassembly is keyed by peer connection and sync ID. It accepts up to 64
 - Last-writer-wins silently discards the losing concurrent edit; there is no conflict UI or version history. A malicious writer can forge another writer's fingerprint in metadata because entries are not individually signed.
 - Files remain plaintext in local IndexedDB. Sync runs only while browser tabs are open; background sync, key rotation, folders, rename, and tombstone garbage collection are out of scope.
 - A removed member retains files and workspace keys already copied. The server learns which workspace members are online, but sync headers and payloads travel over the peer DataChannel and no file metadata is sent through signalling or persisted server-side.
+
+## Phase 7 — Workspace key rotation (Checkpoint A)
+
+### Aim
+
+Checkpoint A adds revocation for future workspace content. When a member is removed or leaves, the owner can rotate to a new random workspace key, rewrap it for the remaining members, and advance the workspace key version. The server manages membership and ciphertext metadata, while browsers generate, wrap, unwrap, and retain keys.
+
+### Server and database changes
+
+- Added `needs_rotation` to `workspaces`, defaulting to false.
+- Added a transactional owner rotation endpoint. It locks the workspace row, checks owner rights and the exact next version, compares the submitted recipient IDs with the current member set, then writes the new name ciphertext and every recipient wrap. It removes the target member and their wrappers when called through member DELETE, revokes all pending invites, advances the key version, clears `needs_rotation`, and commits as one unit.
+- A membership mismatch returns `MEMBERS_CHANGED` with the current recipient directory so the owner can refresh before retrying. A stale version returns a conflict. Owner removal and non-owner rotation are rejected.
+- Replaced the member DELETE shortcut with a request that must contain a new version, sealed name, and wrapped key for all remaining members. The endpoint cannot remove a member without rotating.
+- Added member-only `GET /workspaces/:id/keys` for all key versions the requester can unwrap. The route returns only ciphertext wraps and public wrapper identity data.
+- Added member leave. It deletes that member's wraps and membership, marks the workspace as needing rotation, and notifies connected owner sockets. Owners cannot leave.
+- Invite creation locks the workspace while validating the current version. Invite acceptance locks workspace before invite, rejects stale key versions, and serializes against rotation.
+- Signalling broadcasts `key-rotated`, `rotation-needed`, and removal/kick events. Rotation events carry the version only; no key or plaintext is sent over signalling.
+
+### Browser cryptography and identity pins
+
+- Added a memory-only keyring indexed by workspace and key version. Every loaded workspace key derives separate AES-GCM name and sync keys with HKDF-SHA-256, workspace UUID salt, purpose-specific info, and the uint32 key version. Logout clears all keyring entries; leave and kick clear that workspace.
+- Name ciphertext now uses the derived name key and binds raw workspace UUID plus key version as AAD. Version 1 can read prior name ciphertext encrypted directly under the workspace key and will be re-sealed under the new derivation on rotation.
+- Added IndexedDB schema v2 with a dedicated workspace-member pin store. It stores only workspace/user IDs, the public key, and its SHA-256 fingerprint. First observation is TOFU; a different key is marked as a mismatch and blocks key rotation until the owner explicitly reviews the fingerprint and updates the pin.
+- Rotation and removal confirmation lists recipient fingerprints and requires a second confirmation when any recipient has not been manually verified. The page shows rotation-needed state and provides rotate, remove-and-rotate, leave, and changed-pin review actions.
+- On key rotation, connected workspace pages reload the current workspace and key versions. Kicked clients clear workspace key material and leave the workspace view.
+
+### Security properties and limits
+
+- Removed members lose API access, membership, and stored key wraps immediately. Once the owner rotates, that member does not receive the new key and cannot decrypt new content.
+- Old wraps remain for remaining members, preserving access to older workspace content. A member may retain old keys and plaintext already copied; revocation cannot erase local history.
+- The server sees workspace membership, key versions, and ciphertext sizes, but does not receive plaintext workspace names, workspace keys, or private identity keys.
+- Chat is not encrypted with the workspace key. It relies on WebRTC DTLS and the authenticated transport session, as captured in the README known limitations.
+- Checkpoint A is the local library/API foundation; Checkpoint B is documented below.
+
+### Checkpoint A verification
+
+- `pnpm typecheck` and `pnpm lint` validate the workspace.
+- `pnpm --filter @zerocloud/shared test` covers versioned key derivation and legacy name compatibility.
+- `pnpm --filter @zerocloud/web test` covers IndexedDB TOFU pinning, mismatch blocking, and explicit pin replacement.
+- With an isolated test database `zerocloud_test`, `pnpm --filter @zerocloud/signal test` covers the migration, invite version checks, transactional rotation metadata, mandatory removal payload, leave state, and key-version retrieval.
+- Manual workflow: open an owner workspace and a second member browser profile; mark fingerprints verified from the peer panel; rotate and confirm both profiles load the new version; remove the member with rotation and confirm their workspace route is denied; then test a non-owner leave and verify the owner's rotation-needed banner.
+
+## Phase 7 — Workspace key rotation (Checkpoint B)
+
+### Aim
+
+Checkpoint B gates the active workspace data plane on proof of the current workspace key. It prevents sync, workspace file transfers, and chat from being used until each peer has independently demonstrated possession of the same current key version. It also handles version skew and rotation on already-open connections.
+
+### Wire protocol and cryptographic flow
+
+- Added strict `ws-proof` and `stale-key` sync control message types and a required `keyVersion` in every authenticated sync header. The header remains cleartext and contains no file metadata. It is validated before crypto; a different workspace is dropped before decryption.
+- A peer sends an encrypted `ws-proof` after the Phase 4 session handshake. Proof plaintext is SHA-256 over `zerocloud/v1/ws-proof`, independently sorted local/remote nonces, and ordered sender/receiver fingerprints. The sender's own nonce is also included as an explicit direction marker. That extra field is needed to ensure reflection fails in the same-identity case, where the two fingerprint strings are identical. Receiver recomputation swaps sender/receiver roles. Proof data is first sealed with the version-specific workspace sync key and inner AAD, then with the Phase 4 session key and outer header/fingerprint AAD.
+- Once each side has sent and validated a proof for the same current key version, the peer is workspace-verified. Proof state and active transfers are invalidated as soon as rotation is announced. The client reloads workspace keys and sends a new proof after successful refresh.
+- Normal sync messages are double-sealed: inner AES-GCM under the workspace sync key, then outer AES-GCM under the session key. Inner AAD binds workspace, key version, message type, sync ID, and fragment bounds; outer AAD binds every strict cleartext header field (including sequence and key version) and both handshake-bound fingerprints.
+- Sync-purpose file offers receive workspace-key inner sealing bound to workspace, key version, transfer ID, and ordered peer fingerprints. Their existing Phase 4 session envelope remains. Quick Send is excluded from workspace-key sealing and is disabled unless the recipient has current workspace proof.
+- `stale-key` has empty plaintext and is authenticated only by the outer session seal. Its key version and sequence are authenticated by the header and it consumes the ordinary per-connection replay sequence. Version skew triggers a maximum 30-second wait and one key refresh capped at 10 seconds; successful refresh reproves. A failed or unavailable key leaves the peer unverified/no-access.
+- Both outgoing and incoming chat are gated by current workspace verification. Chat is deliberately not workspace-key encrypted; it continues to rely on WebRTC DTLS and the Phase 4 transport session.
+- A membership removal marks the matching live peer no-access, cancels its outgoing transfers, and disposes incoming transfer state. Rotation clears verification for all remaining connected peers until the new version is proven.
+
+### Limits, tests, and development controls
+
+- Raised the fragment limit to 128 while retaining the 1 MiB total-manifest cap, 500-entry cap, original field-length constraints, 30-second reassembly timeout, and 16 KiB wire cap. Fragment plaintext is capped at 11 KiB.
+- Added tests for the largest valid worst-case escaped manifest, oversized aggregate data, fragment overflow, key-version AAD tampering, replay and lower sequence rejection, cross-connection replay, strict-header extra-field rejection, and reflected proof rejection including same-identity peers.
+- `NEXT_PUBLIC_DEBUG_IGNORE_KICK` and `NEXT_PUBLIC_DEBUG_BLOCK_KEYFETCH` support manual stale-key timeout exercises and should remain off outside local development.
+
+### Manual Checkpoint B verification
+
+1. Run `docker compose up -d`, `pnpm db:migrate`, and `pnpm dev`; open a workspace from two authenticated browser profiles.
+2. Join both profiles. Wait until both peer rows show the current workspace version verified. Confirm chat and workspace sync/file actions only work after verification.
+3. Upload and sync a file, then rotate the workspace key. Remaining peers should return to verifying and become verified at the new version before syncing again.
+4. Remove a member with rotation. The removed member's active row should show no access, outgoing/incoming transfer activity should stop, and its workspace route should be denied on refresh.
+5. For version skew testing, enable the development kick-ignore and key-fetch-block flags for the old member's profile, then rotate from the owner. Verify that the old profile never regains workspace data-plane access and eventually reports no access after the wait.
+6. Run `pnpm test`, `pnpm typecheck`, and `pnpm lint`.
+
+### Checkpoint B limits
+
+The cleartext header reveals message type, workspace ID, key version, sequence, and fragment size/count to the connected peer browser, but is never sent through the signalling server. DataChannels also use DTLS. Chat is transport-encrypted but not workspace-key encrypted. A current-key proof establishes key possession, not honest behavior; members can retain old plaintext and may collude with a current member who shares new content.

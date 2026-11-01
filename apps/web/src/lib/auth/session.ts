@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { z } from "zod";
+import { workspaceKeyring } from "../workspaces/keyring";
 
 export const sessionUserSchema = z.object({
   id: z.string().uuid(),
@@ -51,10 +52,12 @@ export const useAuthStore = create<AuthState>((set) => ({
     }
   },
   setSession: (session) => {
+    workspaceKeyring.clearAll();
     sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
     set({ ...session, ready: true });
   },
   clearSession: () => {
+    workspaceKeyring.clearAll();
     sessionStorage.removeItem(SESSION_KEY);
     set({ accessToken: null, user: null, ready: true });
   },

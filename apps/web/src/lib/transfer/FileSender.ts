@@ -44,6 +44,7 @@ export class FileSender {
     private readonly peerId: string,
     private readonly channel: RTCDataChannel,
     private readonly cryptoContext: PeerCryptoContext,
+    private readonly wrapSyncOffer?: (offer: FileOfferMessage) => Promise<string>,
   ) {}
 
   enqueue(file: File, transferId: number, options?: SyncTransferOptions): void {
@@ -125,6 +126,16 @@ export class FileSender {
     if (job !== this.active) this.queue.splice(this.queue.indexOf(job), 1);
   }
 
+  cancelAll(reason: string): void {
+    if (this.active) this.cancel(this.active.transferId, reason);
+    for (const job of this.queue.splice(0)) {
+      job.cancelled = true;
+      job.wakeBuffer?.();
+      job.pending?.resolve(null);
+      this.finish(job, "cancelled", reason);
+    }
+  }
+
   dispose(reason = "Peer disconnected"): void {
     this.disposed = true;
     if (this.active) {
@@ -195,7 +206,7 @@ export class FileSender {
     );
 
     this.setState(job, "waiting");
-    this.send(offer);
+    await this.sendOffer(job, offer);
     const response = await this.waitFor(job, 60_000);
     if (job.cancelled || this.disposed) return;
     if (!response && !job.cancelled) {
@@ -353,6 +364,18 @@ export class FileSender {
         this.log(`wire-control:${message.type}:bytes=${utf8(wire).length}`);
       }
     }
+  }
+
+  private async sendOffer(job: Job, offer: FileOfferMessage): Promise<void> {
+    if (job.options?.purpose === "sync") {
+      if (!this.wrapSyncOffer) throw new Error("Workspace key is unavailable for sync offer");
+      const wire = await this.wrapSyncOffer(offer);
+      if (job.cancelled || this.disposed) return;
+      this.channel.send(wire);
+      this.events.emit("log", { peerId: this.peerId, event: "sync-file-offer-sealed" });
+      return;
+    }
+    this.send(offer);
   }
 
   private setState(job: Job, state: TransferSnapshot["state"]): void {

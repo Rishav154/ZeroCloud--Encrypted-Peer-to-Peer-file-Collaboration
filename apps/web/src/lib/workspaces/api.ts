@@ -11,7 +11,8 @@ import {
   type IdentityAlgorithm,
 } from "@zerocloud/shared";
 import { z } from "zod";
-import { getOrCreateIdentity } from "../identity/identityStore";
+import { getOrCreateIdentity, loadVerifiedFingerprints, pinWorkspaceMemberKey, type PinResult } from "../identity/identityStore";
+import { workspaceKeyring } from "./keyring";
 import { ApiError } from "../auth/api";
 import type { SessionUser } from "../auth/session";
 
@@ -33,6 +34,7 @@ const workspaceDetailSchema = z.object({
     id: z.string().uuid(),
     nameSealed: z.string(),
     currentKeyVersion: z.number().int().positive(),
+    needsRotation: z.boolean(),
     role: z.enum(["owner", "editor", "viewer"]),
     wrappedKey: z.string(),
     wrapperUserId: z.string().uuid(),
@@ -44,6 +46,7 @@ const workspaceDetailSchema = z.object({
       role: z.enum(["owner", "editor", "viewer"]),
       fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
       publicKey: z.string(),
+      keyAlg: z.enum(["X25519", "P-256"]),
     }),
   ),
 });
@@ -56,8 +59,9 @@ export type WorkspaceView = {
   name: string;
   role: "owner" | "editor" | "viewer";
   currentKeyVersion: number;
+  needsRotation: boolean;
   workspaceKey: CryptoKey;
-  members: WorkspaceMember[];
+  members: (WorkspaceMember & { pinStatus: PinResult; verified: boolean })[];
 };
 
 async function apiRequest<T>(
@@ -86,13 +90,14 @@ async function apiRequest<T>(
   }
   const payload: unknown = await response.json().catch(() => null);
   if (!response.ok) {
-    const error = z
-      .object({ error: z.object({ code: z.string(), message: z.string() }) })
-      .safeParse(payload);
+    const nested = z.object({ error: z.object({ code: z.string(), message: z.string() }) }).safeParse(payload);
+    const direct = z.object({ code: z.string(), message: z.string() }).safeParse(payload);
+    const error = nested.success ? nested.data.error : direct.success ? direct.data : null;
     throw new ApiError(
-      error.success ? error.data.error.message : "Request failed",
-      error.success ? error.data.error.code : "REQUEST_FAILED",
+      error?.message ?? "Request failed",
+      error?.code ?? "REQUEST_FAILED",
       response.status,
+      payload,
     );
   }
   const parsed = schema.safeParse(payload);
@@ -128,6 +133,7 @@ export async function createWorkspace(
   const workspaceId = crypto.randomUUID();
   const workspaceKey = await generateWorkspaceKey();
   const nameSealed = await sealWorkspaceName(workspaceKey, workspaceId, name);
+  await workspaceKeyring.add(workspaceId, 1, workspaceKey);
   const wrappedKey = await wrapWorkspaceKey(workspaceKey, identity.privateKey, {
     wrapperPublicKeyRaw: identity.publicKeyRaw,
     recipientPublicKeyRaw: identity.publicKeyRaw,
@@ -187,9 +193,18 @@ export async function loadWorkspace(
     `/workspaces/${encodeURIComponent(workspaceId)}`,
     workspaceDetailSchema,
   );
-  const wrapper = members.find(
-    (member) => member.userId === workspace.wrapperUserId,
-  );
+  const verifiedFingerprints = await loadVerifiedFingerprints();
+  const pins = await Promise.all(members.map(async (member) => ({
+    ...member,
+    verified: verifiedFingerprints.has(member.fingerprint),
+    pinStatus: await pinWorkspaceMemberKey({
+      workspaceId: workspace.id,
+      userId: member.userId,
+      fingerprint: member.fingerprint,
+      publicKey: member.publicKey,
+    }),
+  })));
+  const wrapper = pins.find((member) => member.userId === workspace.wrapperUserId);
   if (!wrapper) {
     throw new ApiError(
       "Workspace key wrapper identity is missing",
@@ -197,31 +212,73 @@ export async function loadWorkspace(
       409,
     );
   }
+  if (wrapper.keyAlg !== identity.algorithm) {
+    throw new ApiError("Workspace key wrapper uses an identity algorithm this browser cannot unwrap", "KEY_ALGORITHM_MISMATCH", 409);
+  }
   const workspaceKey = await unwrapWorkspaceKey(
     workspace.wrappedKey,
     identity.privateKey,
     {
       wrapperPublicKeyRaw: base64ToBytes(wrapper.publicKey),
       recipientPublicKeyRaw: identity.publicKeyRaw,
-      algorithm: sessionAlgorithm(user),
+      algorithm: wrapper.keyAlg,
       workspaceId: workspace.id,
       keyVersion: workspace.currentKeyVersion,
       wrapperFingerprint: wrapper.fingerprint,
       recipientFingerprint: identity.fingerprint,
     },
   );
+  const keys = await apiRequest(token, `/workspaces/${workspace.id}/keys`, z.object({
+    workspaceId: z.string().uuid(),
+    currentKeyVersion: z.number().int().positive(),
+    nameSealed: z.string(),
+    keys: z.array(z.object({
+      keyVersion: z.number().int().positive(),
+      wrappedKey: z.string(),
+      wrapperUserId: z.string().uuid(),
+      wrapperPublicKey: z.string(),
+      wrapperFingerprint: z.string(),
+      wrapperKeyAlg: z.enum(["X25519", "P-256"]),
+    })),
+  }));
+  for (const entry of keys.keys) {
+    const versionWrapper = pins.find((member) => member.userId === entry.wrapperUserId);
+    if (!versionWrapper || versionWrapper.publicKey !== entry.wrapperPublicKey || versionWrapper.fingerprint !== entry.wrapperFingerprint || versionWrapper.keyAlg !== entry.wrapperKeyAlg) {
+      throw new ApiError("Workspace key wrapper identity does not match its pinned directory key", "KEY_WRAPPER_MISMATCH", 409);
+    }
+    if (entry.wrapperKeyAlg !== identity.algorithm) {
+      throw new ApiError("A historical workspace key uses an unsupported identity algorithm", "KEY_ALGORITHM_MISMATCH", 409);
+    }
+    const versionKey = entry.keyVersion === workspace.currentKeyVersion
+      ? workspaceKey
+      : await unwrapWorkspaceKey(entry.wrappedKey, identity.privateKey, {
+          wrapperPublicKeyRaw: base64ToBytes(versionWrapper.publicKey),
+          recipientPublicKeyRaw: identity.publicKeyRaw,
+          algorithm: versionWrapper.keyAlg,
+          workspaceId: workspace.id,
+          keyVersion: entry.keyVersion,
+          wrapperFingerprint: versionWrapper.fingerprint,
+          recipientFingerprint: identity.fingerprint,
+        });
+    if (entry.keyVersion === workspace.currentKeyVersion && entry.wrappedKey !== workspace.wrappedKey) {
+      throw new ApiError("Workspace key list is inconsistent", "INVALID_RESPONSE", 502);
+    }
+    await workspaceKeyring.add(workspace.id, entry.keyVersion, versionKey);
+  }
   const name = await openWorkspaceName(
     workspaceKey,
     workspace.id,
     workspace.nameSealed,
+    workspace.currentKeyVersion,
   );
   return {
     id: workspace.id,
     name,
     role: workspace.role,
     currentKeyVersion: workspace.currentKeyVersion,
+    needsRotation: workspace.needsRotation,
     workspaceKey,
-    members,
+    members: pins,
   };
 }
 
@@ -343,15 +400,91 @@ export async function changeWorkspaceMemberRole(
 
 export async function removeWorkspaceMember(
   token: string,
-  workspaceId: string,
+  user: SessionUser,
+  workspace: WorkspaceView,
   userId: string,
+  confirmRecipients: (workspace: WorkspaceView) => Promise<boolean>,
 ): Promise<void> {
-  await apiRequest(
-    token,
-    `/workspaces/${workspaceId}/members/${userId}`,
-    z.object({ removed: z.literal(true) }),
-    { method: "DELETE" },
-  );
+  const identity = await getOrCreateIdentity(process.env.NEXT_PUBLIC_FORCE_P256 === "true");
+  let latest = workspace;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const recipients = latest.members.filter((member) => member.userId !== userId);
+    if (recipients.some((member) => member.pinStatus === "mismatch" || member.pinStatus === "invalid")) {
+      throw new ApiError("A recipient key changed: possible server tampering", "MEMBER_KEY_CHANGED", 409);
+    }
+    if (!await confirmRecipients(latest)) throw new ApiError("Rotation cancelled", "ROTATION_CANCELLED", 0);
+    const workspaceKey = await generateWorkspaceKey();
+    const nextVersion = latest.currentKeyVersion + 1;
+    const nameSealed = await sealWorkspaceName(workspaceKey, latest.id, latest.name, nextVersion);
+    const wrappedKeys = await Promise.all(recipients.map(async (member) => {
+      if (member.keyAlg !== identity.algorithm) throw new ApiError(`Cannot wrap the workspace key for ${member.displayName}: key algorithms differ`, "KEY_ALGORITHM_MISMATCH", 409);
+      return { userId: member.userId, wrappedKey: await wrapWorkspaceKey(workspaceKey, identity.privateKey, {
+        wrapperPublicKeyRaw: identity.publicKeyRaw,
+        recipientPublicKeyRaw: base64ToBytes(member.publicKey),
+        algorithm: identity.algorithm,
+        workspaceId: latest.id,
+        keyVersion: nextVersion,
+        wrapperFingerprint: identity.fingerprint,
+        recipientFingerprint: member.fingerprint,
+      }) };
+    }));
+    try {
+      const response = await apiRequest(token, `/workspaces/${latest.id}/members/${userId}`, z.object({ version: z.number().int(), needsRotation: z.literal(false) }), {
+        method: "DELETE",
+        body: JSON.stringify({ newVersion: nextVersion, nameSealed, wrappedKeys }),
+      });
+      await workspaceKeyring.add(latest.id, response.version, workspaceKey);
+      return;
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.code !== "MEMBERS_CHANGED" || attempt === 2) throw error;
+      latest = await loadWorkspace(token, user, latest.id);
+    }
+  }
+}
+
+export async function rotateWorkspaceKey(
+  token: string,
+  user: SessionUser,
+  workspace: WorkspaceView,
+  confirmRecipients: (workspace: WorkspaceView) => Promise<boolean>,
+): Promise<void> {
+  const identity = await getOrCreateIdentity(process.env.NEXT_PUBLIC_FORCE_P256 === "true");
+  let latest = workspace;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (latest.members.some((member) => member.pinStatus === "mismatch" || member.pinStatus === "invalid")) throw new ApiError("A member key changed: possible server tampering", "MEMBER_KEY_CHANGED", 409);
+    if (!await confirmRecipients(latest)) throw new ApiError("Rotation cancelled", "ROTATION_CANCELLED", 0);
+    const nextVersion = latest.currentKeyVersion + 1;
+    const workspaceKey = await generateWorkspaceKey();
+    const nameSealed = await sealWorkspaceName(workspaceKey, latest.id, latest.name, nextVersion);
+    const wrappedKeys = await Promise.all(latest.members.map(async (member) => {
+      if (member.keyAlg !== identity.algorithm) throw new ApiError(`Cannot wrap the workspace key for ${member.displayName}: key algorithms differ`, "KEY_ALGORITHM_MISMATCH", 409);
+      return { userId: member.userId, wrappedKey: await wrapWorkspaceKey(workspaceKey, identity.privateKey, {
+        wrapperPublicKeyRaw: identity.publicKeyRaw,
+        recipientPublicKeyRaw: base64ToBytes(member.publicKey),
+        algorithm: identity.algorithm,
+        workspaceId: latest.id,
+        keyVersion: nextVersion,
+        wrapperFingerprint: identity.fingerprint,
+        recipientFingerprint: member.fingerprint,
+      }) };
+    }));
+    try {
+      const response = await apiRequest(token, `/workspaces/${latest.id}/rotate`, z.object({ version: z.number().int(), needsRotation: z.literal(false) }), {
+        method: "POST",
+        body: JSON.stringify({ newVersion: nextVersion, nameSealed, wrappedKeys }),
+      });
+      await workspaceKeyring.add(latest.id, response.version, workspaceKey);
+      return;
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.code !== "MEMBERS_CHANGED" || attempt === 2) throw error;
+      latest = await loadWorkspace(token, user, latest.id);
+    }
+  }
+}
+
+export async function leaveWorkspace(token: string, workspaceId: string): Promise<void> {
+  await apiRequest(token, `/workspaces/${workspaceId}/leave`, z.object({ left: z.literal(true), needsRotation: z.literal(true) }), { method: "POST" });
+  workspaceKeyring.clearWorkspace(workspaceId);
 }
 
 export async function fetchInvite(
@@ -400,6 +533,7 @@ export async function acceptInvite(
     invite.inviteId,
     invite.keyVersion,
   );
+  await workspaceKeyring.add(invite.workspaceId, invite.keyVersion, workspaceKey);
   const wrappedForSelf = await wrapWorkspaceKey(
     workspaceKey,
     identity.privateKey,

@@ -22,24 +22,87 @@ type AcquireResult =
 
 const DATABASE_NAME = "zerocloud-identity";
 const STORE_NAME = "records";
+const PINS_STORE_NAME = "workspace-member-pins";
 let databasePromise: Promise<IDBDatabase> | null = null;
 
 function openDatabase(): Promise<IDBDatabase> {
   if (databasePromise) return databasePromise;
   databasePromise = new Promise((resolve, reject) => {
-    const request = indexedDB.open(DATABASE_NAME, 1);
+    const request = indexedDB.open(DATABASE_NAME, 2);
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains(STORE_NAME)) {
         request.result.createObjectStore(STORE_NAME, { keyPath: "id" });
       }
+      if (!request.result.objectStoreNames.contains(PINS_STORE_NAME)) {
+        request.result.createObjectStore(PINS_STORE_NAME, { keyPath: ["workspaceId", "userId"] });
+      }
     };
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      request.result.onversionchange = () => request.result.close();
+      resolve(request.result);
+    };
     request.onerror = () =>
       reject(request.error ?? new Error("Could not open identity database"));
     request.onblocked = () =>
       reject(new Error("Identity database upgrade is blocked"));
   });
   return databasePromise;
+}
+
+export type WorkspaceMemberPin = {
+  workspaceId: string;
+  userId: string;
+  fingerprint: string;
+  publicKey: string;
+};
+
+export type PinResult = "pinned" | "match" | "mismatch" | "invalid";
+
+export async function pinWorkspaceMemberKey(
+  candidate: WorkspaceMemberPin,
+): Promise<PinResult> {
+  let actual: string;
+  try {
+    actual = await fingerprintPublicKey(
+      Uint8Array.from(atob(candidate.publicKey), (char) => char.charCodeAt(0)),
+    );
+  } catch {
+    return "invalid";
+  }
+  if (actual !== candidate.fingerprint) return "invalid";
+  const database = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(PINS_STORE_NAME, "readwrite");
+    const store = transaction.objectStore(PINS_STORE_NAME);
+    const request = store.get([candidate.workspaceId, candidate.userId]);
+    let result: PinResult = "pinned";
+    request.onsuccess = () => {
+      const existing = request.result as WorkspaceMemberPin | undefined;
+      if (!existing) store.add(candidate);
+      else result = existing.fingerprint === candidate.fingerprint && existing.publicKey === candidate.publicKey ? "match" : "mismatch";
+    };
+    request.onerror = () => reject(request.error ?? new Error("Could not read member key pin"));
+    transaction.oncomplete = () => resolve(result);
+    transaction.onerror = () => reject(transaction.error ?? new Error("Could not store member key pin"));
+    transaction.onabort = () => reject(transaction.error ?? new Error("Member key pin operation was aborted"));
+  });
+}
+
+export async function confirmWorkspaceMemberKeyPinUpdate(
+  candidate: WorkspaceMemberPin,
+): Promise<void> {
+  const result = await pinWorkspaceMemberKey(candidate);
+  if (result === "invalid") throw new Error("Member public key fingerprint is invalid");
+  if (result === "mismatch") {
+    const database = await openDatabase();
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(PINS_STORE_NAME, "readwrite");
+      transaction.objectStore(PINS_STORE_NAME).put(candidate);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error ?? new Error("Could not update member key pin"));
+      transaction.onabort = () => reject(transaction.error ?? new Error("Member key pin update was aborted"));
+    });
+  }
 }
 
 async function readRecord<T>(id: string): Promise<T | undefined> {

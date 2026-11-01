@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import QRCode from "qrcode";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { formatFingerprint } from "@zerocloud/shared";
@@ -24,12 +24,17 @@ import {
   listWorkspaceInvites,
   loadWorkspace,
   removeWorkspaceMember,
+  rotateWorkspaceKey,
+  leaveWorkspace,
   revokeWorkspaceInvite,
   type InviteRecord,
   type WorkspaceView,
 } from "../../../lib/workspaces/api";
+import { workspaceKeyring } from "../../../lib/workspaces/keyring";
+import { confirmWorkspaceMemberKeyPinUpdate, saveVerifiedFingerprint } from "../../../lib/identity/identityStore";
 
 function WorkspaceDetail() {
+  const router = useRouter();
   const params = useParams<{ id: string }>();
   const token = useAuthStore((state) => state.accessToken);
   const user = useAuthStore((state) => state.user);
@@ -97,8 +102,31 @@ function WorkspaceDetail() {
     void load();
   }, [load]);
 
+  useEffect(() => {
+    const onUpdated = (event: Event): void => {
+      const updated = (event as CustomEvent<WorkspaceView>).detail;
+      if (updated?.id === params.id) setWorkspace(updated);
+    };
+    const onRotationNeeded = (event: Event): void => {
+      const eventWorkspaceId = (event as CustomEvent<string>).detail;
+      if (eventWorkspaceId === params.id) setWorkspace((current) => current ? { ...current, needsRotation: true } : current);
+    };
+    const onKicked = (event: Event): void => {
+      const eventWorkspaceId = (event as CustomEvent<string>).detail;
+      if (eventWorkspaceId === params.id) router.push("/workspaces");
+    };
+    window.addEventListener("zerocloud:workspace-updated", onUpdated);
+    window.addEventListener("zerocloud:rotation-needed", onRotationNeeded);
+    window.addEventListener("zerocloud:workspace-kicked", onKicked);
+    return () => {
+      window.removeEventListener("zerocloud:workspace-updated", onUpdated);
+      window.removeEventListener("zerocloud:rotation-needed", onRotationNeeded);
+      window.removeEventListener("zerocloud:workspace-kicked", onKicked);
+    };
+  }, [params.id, router]);
+
   async function makeInvite(): Promise<void> {
-    if (!token || !workspace) return;
+    if (!token || !workspace || !user) return;
     setBusy(true);
     try {
       const result = await createWorkspaceInvite(
@@ -127,7 +155,7 @@ function WorkspaceDetail() {
   }
 
   async function revoke(inviteId: string): Promise<void> {
-    if (!token || !workspace) return;
+    if (!token || !workspace || !user) return;
     try {
       await revokeWorkspaceInvite(token, workspace.id, inviteId);
       setInvites((current) =>
@@ -177,28 +205,65 @@ function WorkspaceDetail() {
   }
 
   async function removeMember(userId: string): Promise<void> {
-    if (
-      !token ||
-      !workspace ||
-      !window.confirm("Remove this member from the workspace?")
-    )
-      return;
+    if (!token || !workspace || !user) return;
     try {
-      await removeWorkspaceMember(token, workspace.id, userId);
-      setWorkspace((current) =>
-        current
-          ? {
-              ...current,
-              members: current.members.filter(
-                (member) => member.userId !== userId,
-              ),
-            }
-          : current,
-      );
+      await removeWorkspaceMember(token, user, workspace, userId, async (latest) => {
+        const target = latest.members.find((member) => member.userId === userId);
+        const recipients = latest.members.filter((member) => member.userId !== userId);
+        const summary = recipients.map((member) => `${member.displayName}: ${member.verified ? "Verified" : "Unverified"} · ${formatFingerprint(member.fingerprint)}`).join("\n");
+        if (!window.confirm(`Remove ${target?.displayName ?? "this member"} and rotate the key for these recipients?\n${summary}`)) return false;
+        return !recipients.some((member) => !member.verified) || window.confirm("One or more recipients are unverified. Compare each listed fingerprint through a trusted channel before proceeding.");
+      });
+      await load();
     } catch (caught) {
       setError(
         caught instanceof Error ? caught.message : "Could not remove member",
       );
+    }
+  }
+
+  async function rotateKey(): Promise<void> {
+    if (!token || !workspace || !user) return;
+    if (workspace.members.some((member) => member.pinStatus === "mismatch" || member.pinStatus === "invalid")) {
+      setError("A member key changed: possible server tampering. Rotation is blocked.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await rotateWorkspaceKey(token, user, workspace, async (latest) => {
+        const latestSummary = latest.members.map((member) => `${member.displayName}: ${member.verified ? "Verified" : "Unverified"} · ${formatFingerprint(member.fingerprint)}`).join("\n");
+        if (!window.confirm(`Rotate the workspace key for these members?\n${latestSummary}`)) return false;
+        return !latest.members.some((member) => !member.verified) || window.confirm("One or more members are unverified. Compare each listed fingerprint through a trusted channel before proceeding.");
+      });
+      await load();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not rotate workspace key");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function leave(): Promise<void> {
+    if (!token || !workspace || !window.confirm("Leave this workspace? The owner will need to rotate its key.")) return;
+    try {
+      await leaveWorkspace(token, workspace.id);
+      workspaceKeyring.clearWorkspace(workspace.id);
+      router.push("/workspaces");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not leave workspace");
+    }
+  }
+
+  async function updateMemberPin(userId: string): Promise<void> {
+    if (!workspace) return;
+    const member = workspace.members.find((entry) => entry.userId === userId);
+    if (!member || !window.confirm(`The key for ${member.displayName} changed. Verify this fingerprint out of band before replacing the saved pin:\n${formatFingerprint(member.fingerprint)}\n\nProceed with the pin update?`)) return;
+    try {
+      await confirmWorkspaceMemberKeyPinUpdate({ workspaceId: workspace.id, userId, fingerprint: member.fingerprint, publicKey: member.publicKey });
+      await saveVerifiedFingerprint(member.fingerprint);
+      await load();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not update the member key pin");
     }
   }
 
@@ -232,6 +297,15 @@ function WorkspaceDetail() {
               <p className="mt-2 text-sm text-zinc-500">
                 Key version {workspace.currentKeyVersion}
               </p>
+              {workspace.needsRotation && (
+                <p role="status" className="mt-3 rounded-lg border border-amber-800 bg-amber-950/40 p-3 text-sm text-amber-200">
+                  A member left. Rotate the workspace key to protect new content from their old key.
+                </p>
+              )}
+              <div className="mt-4 flex gap-2">
+                {workspace.role === "owner" && <Button disabled={busy} onClick={() => void rotateKey()}>Rotate workspace key</Button>}
+                {workspace.role !== "owner" && <Button variant="outline" onClick={() => void leave()}>Leave workspace</Button>}
+              </div>
             </header>
             <nav
               aria-label="Workspace sections"
@@ -266,6 +340,7 @@ function WorkspaceDetail() {
                   </CardHeader>
                   <CardContent className="space-y-3">
                     {visibleMembers.map((member) => {
+                      const pinStatus = workspace?.members.find((entry) => entry.userId === member.userId)?.pinStatus ?? "pinned";
                       const online = Object.values(peers).filter(
                         (peer) => peer.userId === member.userId,
                       );
@@ -290,6 +365,9 @@ function WorkspaceDetail() {
                                   Verified
                                 </span>
                               )}
+                              <span className={`ml-2 rounded-full px-2 py-0.5 text-[10px] ${pinStatus === "match" ? "bg-emerald-950 text-emerald-200" : pinStatus === "mismatch" || pinStatus === "invalid" ? "bg-rose-950 text-rose-200" : "bg-amber-950 text-amber-200"}`}>
+                                {pinStatus === "match" ? "Pinned" : pinStatus === "mismatch" || pinStatus === "invalid" ? "Key changed" : "Unverified"}
+                              </span>
                             </p>
                             <p className="mt-1 break-all font-mono text-xs text-zinc-500">
                               {formatFingerprint(member.fingerprint)}
@@ -304,6 +382,7 @@ function WorkspaceDetail() {
                             {workspace.role === "owner" &&
                             member.role !== "owner" ? (
                               <>
+                                {pinStatus === "mismatch" && <Button variant="outline" className="px-2 py-1 text-xs" onClick={() => void updateMemberPin(member.userId)}>Review changed key</Button>}
                                 <select
                                   aria-label={`Role for ${member.displayName}`}
                                   value={member.role}
@@ -325,7 +404,7 @@ function WorkspaceDetail() {
                                     void removeMember(member.userId)
                                   }
                                 >
-                                  Remove
+                                  Remove and rotate key
                                 </Button>
                               </>
                             ) : (
@@ -445,8 +524,7 @@ function WorkspaceDetail() {
               />
             )}
             <p className="mt-5 rounded-lg border border-amber-900/70 bg-amber-950/30 p-4 text-sm text-amber-200">
-              Removed members keep files and workspace keys they already have;
-              removal cannot erase prior local copies.
+              Removed members keep files they already received but cannot decrypt anything new.
             </p>
             <div className="mt-5">
               <Button variant="outline" onClick={() => void load()}>

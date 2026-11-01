@@ -60,7 +60,6 @@ export default function WorkspacePeerPanel({
     peerId,
     activeWorkspaceId,
     isJoined,
-    openPeerCount,
     joinWorkspace,
     leaveWorkspace,
     sendChat,
@@ -78,6 +77,7 @@ export default function WorkspacePeerPanel({
   const syncStateHash = useSyncStore((state) => state.stateHash);
   const peersById = usePeerStore((state) => state.peers);
   const peers = Object.values(peersById);
+  const verifiedPeers = peers.filter((peer) => peer.workspaceState === "verified");
   const messages = usePeerStore((state) => state.messages);
   const events = usePeerStore((state) => state.events);
   const lastError = usePeerStore((state) => state.lastError);
@@ -370,7 +370,10 @@ export default function WorkspacePeerPanel({
                                   {peer.verified ? "Verified" : "Unverified"}
                                 </span>
                               )}
-                              {peer.handshakeState === "secure" && (
+                              <span className={`rounded-full px-2 py-0.5 ${peer.workspaceState === "verified" ? "bg-emerald-950 text-emerald-200" : peer.workspaceState === "no-access" ? "bg-rose-950 text-rose-200" : "bg-amber-950 text-amber-200"}`}>
+                                {peer.workspaceState === "verified" ? `Workspace verified · v${peer.workspaceVerifiedVersion}` : peer.workspaceState === "waiting-for-key" ? "waiting for key" : peer.workspaceState === "no-access" ? "no workspace access" : peer.workspaceState === "verifying" ? "verifying workspace key" : "workspace unverified"}
+                              </span>
+                              {peer.workspaceState === "verified" && (
                                 <span
                                   className={`rounded-full px-2 py-0.5 ${syncPeerStatuses[peer.peerId] === "in-sync" ? "bg-emerald-950 text-emerald-200" : syncPeerStatuses[peer.peerId] === "error" ? "bg-rose-950 text-rose-200" : "bg-amber-950 text-amber-200"}`}
                                 >
@@ -458,11 +461,11 @@ export default function WorkspacePeerPanel({
                 <input
                   value={chatText}
                   onChange={(event) => setChatText(event.target.value)}
-                  disabled={!isJoined || openPeerCount === 0}
+                  disabled={!isJoined || verifiedPeers.length === 0}
                   maxLength={4000}
                   className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm text-zinc-100 outline-none transition placeholder:text-zinc-600 focus:border-violet-400 disabled:opacity-50"
                   placeholder={
-                    openPeerCount > 0
+                    verifiedPeers.length > 0
                       ? "Write a message…"
                       : "Waiting for a connected peer…"
                   }
@@ -470,7 +473,7 @@ export default function WorkspacePeerPanel({
                 <Button
                   type="submit"
                   disabled={
-                    !chatText.trim() || !isJoined || openPeerCount === 0
+                    !chatText.trim() || !isJoined || verifiedPeers.length === 0
                   }
                 >
                   Send
@@ -508,7 +511,8 @@ export default function WorkspacePeerPanel({
                         .filter(
                           (peer) =>
                             peer.dataChannelState === "open" &&
-                            peer.handshakeState === "secure",
+                            peer.handshakeState === "secure" &&
+                            peer.workspaceState === "verified",
                         )
                         .map((peer) => (
                           <option key={peer.peerId} value={peer.peerId}>
@@ -528,7 +532,8 @@ export default function WorkspacePeerPanel({
                         !peers.some(
                           (peer) =>
                             peer.dataChannelState === "open" &&
-                            peer.handshakeState === "secure",
+                            peer.handshakeState === "secure" &&
+                            peer.workspaceState === "verified",
                         )
                       }
                       onChange={(event) => {

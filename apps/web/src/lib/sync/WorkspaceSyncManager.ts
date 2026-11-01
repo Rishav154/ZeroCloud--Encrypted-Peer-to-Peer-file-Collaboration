@@ -128,11 +128,13 @@ export class WorkspaceSyncManager {
     peerId: string,
     handshakeState: string,
     role: WorkspaceRole | null,
+    workspaceVerified = false,
   ): void {
     if (this.destroyed) return;
     if (
       handshakeState === "secure" &&
       role !== null &&
+      workspaceVerified &&
       this.adapter.isSecure(peerId)
     ) {
       if (!this.securePeers.has(peerId)) {

@@ -1,15 +1,21 @@
 import {
   base64ToBytes,
   bytesToBase64,
+  bytesEqual,
+  buildWorkspaceOfferAad,
+  buildSyncInnerAad,
   compareBytes,
   dataChannelMessageSchema,
   deriveSessionKey,
+  createWorkspaceProofDigest,
+  createSyncId,
   fileControlMessageSchema,
   fingerprintPublicKey,
   helloMessageSchema,
   open,
   readyMessageSchema,
   readyPayloadSchema,
+  syncFileOfferSchema,
   seal,
   utf8,
   buildSyncAad,
@@ -48,6 +54,12 @@ import {
 export type CandidateType = "host" | "srflx" | "relay";
 export type HandshakeState =
   "handshaking" | "secure" | "incompatible" | "identity-mismatch" | "failed";
+export type WorkspacePeerState =
+  | "unverified"
+  | "verifying"
+  | "verified"
+  | "waiting-for-key"
+  | "no-access";
 
 export type PeerSnapshot = {
   peerId: string;
@@ -65,6 +77,8 @@ export type PeerSnapshot = {
   sameIdentity: boolean;
   verified: boolean;
   handshakeError: string | null;
+  workspaceState: WorkspacePeerState;
+  workspaceVerifiedVersion: number | null;
 };
 
 export type PeerManagerEvents = {
@@ -114,6 +128,21 @@ type PeerRecord = {
   syncSendSeq: number;
   syncReceiveGuard: SyncReplayGuard;
   syncSendQueue: Promise<void>;
+  workspaceState: WorkspacePeerState;
+  workspaceVerifiedVersion: number | null;
+  localProofSentVersion: number | null;
+  proofSendScheduledVersion: number | null;
+  remoteProofVerifiedVersion: number | null;
+  waitingTimer: ReturnType<typeof setTimeout> | null;
+  keyFetchPromise: Promise<number> | null;
+  keyFetchAttempted: boolean;
+  accessRevoked: boolean;
+};
+
+export type WorkspaceKeyAccess = {
+  currentVersion: () => number | undefined;
+  get: (version: number) => { syncKey: CryptoKey } | undefined;
+  refresh: () => Promise<number>;
 };
 
 type SignalSender = (to: string, data: SignalData) => void;
@@ -176,6 +205,7 @@ export class PeerManager {
     private readonly sendSignal: SignalSender,
     private readonly identity: StoredIdentity,
     private readonly verifiedFingerprints: Set<string>,
+    private readonly workspaceKeys: WorkspaceKeyAccess,
   ) {}
 
   get peerIds(): string[] {
@@ -288,7 +318,8 @@ export class PeerManager {
     for (const [peerId, peer] of this.peers) {
       if (
         peer.channel?.readyState !== "open" ||
-        peer.handshakeState !== "secure"
+        peer.handshakeState !== "secure" ||
+        !this.isWorkspaceVerified(peer)
       )
         continue;
       try {
@@ -312,6 +343,7 @@ export class PeerManager {
     if (
       peer?.channel?.readyState !== "open" ||
       peer.handshakeState !== "secure" ||
+      !this.isWorkspaceVerified(peer) ||
       !peer.cryptoContext
     )
       return null;
@@ -336,12 +368,15 @@ export class PeerManager {
       peer.handshakeState !== "secure" ||
       !peer.cryptoContext ||
       !peer.directory?.role ||
+      !this.isWorkspaceVerified(peer) ||
       messages.length === 0
     ) {
       return false;
     }
     const task = peer.syncSendQueue.then(async () => {
       if (peer.disposed || peer.channel?.readyState !== "open") return false;
+      const keyVersion = this.workspaceKeys.currentVersion();
+      if (!keyVersion || peer.workspaceVerifiedVersion !== keyVersion || !this.isWorkspaceVerified(peer)) return false;
       const hasManifest = messages.some(
         (message) => message.type === "manifest",
       );
@@ -387,33 +422,21 @@ export class PeerManager {
           throw new Error("Sync message sequence exhausted");
         peer.syncSendSeq = seq;
         for (const message of group) {
+          if (this.workspaceKeys.currentVersion() !== keyVersion || !this.isWorkspaceVerified(peer)) return false;
           const parsed = syncPayloadSchema.safeParse(message);
           if (!parsed.success) throw new Error("Invalid sync payload");
           const partIndex = message.type === "manifest" ? message.partIndex : 0;
           const totalParts =
             message.type === "manifest" ? message.totalParts : 1;
-          const header: SyncHeader = {
-            v: 1,
-            messageType: message.type,
-            workspaceId: this.workspaceId,
-            syncId: message.syncId,
-            partIndex,
-            totalParts,
-            seq,
-          };
+          const header = this.createSyncHeader(peer, message.type, message.syncId, seq, partIndex, totalParts);
           const plaintext = utf8(JSON.stringify(message));
           if (plaintext.byteLength > MAX_SYNC_PLAINTEXT_BYTES) {
-            throw new Error("Sync plaintext exceeds 12,000 bytes");
+            throw new Error("Sync plaintext exceeds 11 KiB");
           }
-          const sealed = await seal(
-            context.sessionKey,
-            plaintext,
-            buildSyncAad(
-              header,
-              context.localFingerprint,
-              context.remoteFingerprint,
-            ),
-          );
+          const workspaceKey = this.workspaceKeys.get(header.keyVersion);
+          if (!workspaceKey) throw new Error("Current workspace sync key is unavailable");
+          const innerSealed = await seal(workspaceKey.syncKey, plaintext, buildSyncInnerAad(header));
+          const sealed = await seal(context.sessionKey, innerSealed, buildSyncAad(header, context.localFingerprint, context.remoteFingerprint));
           const wire = JSON.stringify({
             type: SYNC_TYPE,
             header,
@@ -482,6 +505,49 @@ export class PeerManager {
 
   acceptTransfer(peerId: string, transferId: number): void {
     this.receivers.get(peerId)?.accept(transferId);
+  }
+
+  markMemberRemoved(userId: string): void {
+    for (const [peerId, peer] of this.peers) {
+      if (peer.directory?.userId !== userId) continue;
+      peer.accessRevoked = true;
+      peer.workspaceState = "no-access";
+      peer.workspaceVerifiedVersion = null;
+      peer.localProofSentVersion = null;
+      peer.remoteProofVerifiedVersion = null;
+      this.senders.get(peerId)?.cancelAll("No workspace access");
+      this.receivers.get(peerId)?.dispose("No workspace access");
+      this.receivers.delete(peerId);
+      this.updateState(peerId, peer);
+      this.log("error", "no-workspace-access", peerId);
+    }
+  }
+
+  workspaceKeyUpdated(): void {
+    for (const [peerId, peer] of this.peers) {
+      if (peer.handshakeState !== "secure" || peer.accessRevoked) continue;
+      this.resetWorkspaceProof(peer);
+      this.updateState(peerId, peer);
+      void this.sendWorkspaceProof(peerId, peer);
+    }
+  }
+
+  workspaceRotationAnnounced(version: number): void {
+    for (const [peerId, peer] of this.peers) {
+      if (peer.handshakeState !== "secure" || peer.accessRevoked) continue;
+      this.resetWorkspaceProof(peer);
+      peer.workspaceState = "verifying";
+      this.senders.get(peerId)?.cancelAll("Workspace key rotated");
+      this.updateState(peerId, peer);
+    }
+    this.log("info", `workspace-rotation-announced:${version}`);
+  }
+
+  workspaceAccessLost(): void {
+    for (const [peerId, peer] of this.peers) {
+      peer.accessRevoked = true;
+      this.markNoWorkspaceAccess(peerId, peer, "workspace-access-lost");
+    }
   }
   declineTransfer(peerId: string, transferId: number): void {
     this.receivers.get(peerId)?.decline(transferId);
@@ -556,6 +622,15 @@ export class PeerManager {
       syncSendSeq: 0,
       syncReceiveGuard: new SyncReplayGuard(),
       syncSendQueue: Promise.resolve(),
+      workspaceState: "unverified",
+      workspaceVerifiedVersion: null,
+      localProofSentVersion: null,
+      proofSendScheduledVersion: null,
+      remoteProofVerifiedVersion: null,
+      waitingTimer: null,
+      keyFetchPromise: null,
+      keyFetchAttempted: false,
+      accessRevoked: false,
     };
     this.peers.set(peerId, peer);
 
@@ -668,6 +743,7 @@ export class PeerManager {
     peer.syncSendSeq = 0;
     peer.syncReceiveGuard = new SyncReplayGuard();
     peer.syncSendQueue = Promise.resolve();
+    this.resetWorkspaceProof(peer);
 
     const onOpen = (): void => {
       this.log("info", "datachannel-open", peerId);
@@ -684,6 +760,7 @@ export class PeerManager {
     };
     const onMessage = (event: MessageEvent): void => {
       if (event.data instanceof ArrayBuffer) {
+        if (!this.isWorkspaceVerified(peer)) return;
         const receiver = this.receivers.get(peerId);
         if (receiver) void receiver.handleBinary(event.data);
         else
@@ -693,7 +770,9 @@ export class PeerManager {
       if (event.data instanceof Blob) {
         void event.data
           .arrayBuffer()
-          .then((buffer) => this.receivers.get(peerId)?.handleBinary(buffer));
+          .then((buffer) => {
+            if (this.isWorkspaceVerified(peer)) return this.receivers.get(peerId)?.handleBinary(buffer);
+          });
         return;
       }
       if (typeof event.data !== "string") return;
@@ -728,7 +807,9 @@ export class PeerManager {
   ): FileSender {
     const current = this.senders.get(peerId);
     if (current) return current;
-    const sender = new FileSender(peerId, channel, context);
+    const peer = this.peers.get(peerId);
+    if (!peer) throw new Error("Peer record is unavailable");
+    const sender = new FileSender(peerId, channel, context, (offer) => this.wrapSyncOffer(peerId, peer, offer));
     sender.events.on("transfer", (transfer) =>
       this.events.emit("transfer", transfer),
     );
@@ -797,6 +878,234 @@ export class PeerManager {
     }
   }
 
+  private isWorkspaceVerified(peer: PeerRecord): boolean {
+    const currentVersion = this.workspaceKeys.currentVersion();
+    return Boolean(
+      currentVersion &&
+        peer.workspaceState === "verified" &&
+        peer.workspaceVerifiedVersion === currentVersion &&
+        !peer.accessRevoked,
+    );
+  }
+
+  private resetWorkspaceProof(peer: PeerRecord): void {
+    if (peer.waitingTimer) clearTimeout(peer.waitingTimer);
+    peer.waitingTimer = null;
+    peer.localProofSentVersion = null;
+    peer.proofSendScheduledVersion = null;
+    peer.remoteProofVerifiedVersion = null;
+    peer.workspaceVerifiedVersion = null;
+    peer.workspaceState = peer.handshakeState === "secure" ? "verifying" : "unverified";
+    peer.keyFetchAttempted = false;
+    peer.keyFetchPromise = null;
+  }
+
+  private createSyncHeader(
+    peer: PeerRecord,
+    messageType: SyncHeader["messageType"],
+    syncId: string,
+    seq: number,
+    partIndex = 0,
+    totalParts = 1,
+  ): SyncHeader {
+    const keyVersion = this.workspaceKeys.currentVersion();
+    if (!keyVersion) throw new Error("Workspace key version is unavailable");
+    return {
+      v: 1,
+      messageType,
+      workspaceId: this.workspaceId,
+      keyVersion,
+      syncId,
+      partIndex,
+      totalParts,
+      seq,
+    };
+  }
+
+  private nextSyncSeq(peer: PeerRecord): number {
+    const seq = peer.syncSendSeq + 1;
+    if (seq > 0xffffffff) throw new Error("Sync message sequence exhausted");
+    peer.syncSendSeq = seq;
+    return seq;
+  }
+
+  private async sendWorkspaceProof(peerId: string, peer: PeerRecord): Promise<void> {
+    const version = this.workspaceKeys.currentVersion();
+    const keySet = version ? this.workspaceKeys.get(version) : undefined;
+    if (version && !keySet && !peer.accessRevoked) {
+      this.markNoWorkspaceAccess(peerId, peer, "workspace-sync-key-unavailable");
+      return;
+    }
+    const context = peer.cryptoContext;
+    if (
+      !version || !keySet || !context || !peer.localNonce || !peer.remoteNonce ||
+      peer.handshakeState !== "secure" || peer.disposed || peer.accessRevoked ||
+      peer.channel?.readyState !== "open" || peer.localProofSentVersion === version || peer.proofSendScheduledVersion === version
+    ) return;
+
+    peer.workspaceState = "verifying";
+    peer.workspaceVerifiedVersion = null;
+    peer.proofSendScheduledVersion = version;
+    const task = peer.syncSendQueue.then(async () => {
+      if (peer.disposed || peer.channel?.readyState !== "open" || this.workspaceKeys.currentVersion() !== version) return;
+      const header = this.createSyncHeader(peer, "ws-proof", createSyncId(), this.nextSyncSeq(peer));
+      const digest = await createWorkspaceProofDigest(
+        context.localNonce,
+        context.remoteNonce,
+        context.localFingerprint,
+        context.remoteFingerprint,
+      );
+      const inner = await seal(keySet.syncKey, digest, buildSyncInnerAad(header));
+      const outer = await seal(
+        context.sessionKey,
+        inner,
+        buildSyncAad(header, context.localFingerprint, context.remoteFingerprint),
+      );
+      if (peer.disposed || peer.channel?.readyState !== "open") return;
+      peer.channel.send(JSON.stringify({ type: SYNC_TYPE, header, sealed: bytesToBase64(outer) }));
+      peer.localProofSentVersion = version;
+      if (peer.proofSendScheduledVersion === version) peer.proofSendScheduledVersion = null;
+      this.log("info", `workspace-proof-sent:${version}`, peerId);
+      this.updateWorkspaceVerified(peerId, peer, version);
+    });
+    peer.syncSendQueue = task.then(() => undefined, () => undefined);
+    try {
+      await task;
+      if (peer.proofSendScheduledVersion === version && peer.localProofSentVersion !== version) {
+        peer.proofSendScheduledVersion = null;
+      }
+    } catch (error) {
+      if (peer.proofSendScheduledVersion === version) peer.proofSendScheduledVersion = null;
+      this.markNoWorkspaceAccess(peerId, peer, `workspace-proof-send-failed:${readableError(error)}`);
+    }
+  }
+
+  private updateWorkspaceVerified(peerId: string, peer: PeerRecord, version: number): void {
+    if (
+      peer.localProofSentVersion !== version ||
+      peer.remoteProofVerifiedVersion !== version ||
+      this.workspaceKeys.currentVersion() !== version
+    ) {
+      this.updateState(peerId, peer);
+      return;
+    }
+    if (peer.waitingTimer) clearTimeout(peer.waitingTimer);
+    peer.waitingTimer = null;
+    peer.workspaceState = "verified";
+    peer.workspaceVerifiedVersion = version;
+    this.log("info", `workspace-verified:${version}`, peerId);
+    this.updateState(peerId, peer);
+  }
+
+  private waitForWorkspaceKey(peerId: string, peer: PeerRecord): void {
+    if (peer.accessRevoked) {
+      peer.workspaceState = "no-access";
+      peer.workspaceVerifiedVersion = null;
+      this.updateState(peerId, peer);
+      return;
+    }
+    peer.workspaceState = "waiting-for-key";
+    peer.workspaceVerifiedVersion = null;
+    if (peer.waitingTimer) clearTimeout(peer.waitingTimer);
+    peer.waitingTimer = setTimeout(() => {
+      if (peer.workspaceState !== "verified" && !peer.disposed) {
+        peer.workspaceState = "no-access";
+        peer.workspaceVerifiedVersion = null;
+        this.log("error", "workspace-key-wait-expired", peerId);
+        this.updateState(peerId, peer);
+      }
+    }, 30_000);
+    this.updateState(peerId, peer);
+  }
+
+  private markNoWorkspaceAccess(peerId: string, peer: PeerRecord, event: string): void {
+    if (peer.waitingTimer) clearTimeout(peer.waitingTimer);
+    peer.waitingTimer = null;
+    peer.workspaceState = "no-access";
+    peer.workspaceVerifiedVersion = null;
+    this.senders.get(peerId)?.cancelAll("No workspace access");
+    this.receivers.get(peerId)?.dispose("No workspace access");
+    this.receivers.delete(peerId);
+    this.log("error", event, peerId);
+    this.updateState(peerId, peer);
+  }
+
+  private async fetchWorkspaceKeys(
+    peerId: string,
+    peer: PeerRecord,
+    version: number,
+  ): Promise<boolean> {
+    if (this.workspaceKeys.get(version)) return true;
+    if (peer.keyFetchPromise) {
+      try {
+        await peer.keyFetchPromise;
+      } catch {
+        return false;
+      }
+      return Boolean(this.workspaceKeys.get(version));
+    }
+    if (peer.keyFetchAttempted) return false;
+    peer.keyFetchAttempted = true;
+    const refresh = this.workspaceKeys.refresh();
+    peer.keyFetchPromise = refresh;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const refreshedVersion = await Promise.race([
+        refresh,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error("Workspace key fetch timed out")), 10_000);
+        }),
+      ]);
+      if (refreshedVersion >= version && this.workspaceKeys.get(version)) {
+        this.log("info", `workspace-key-fetch-complete:${refreshedVersion}`, peerId);
+        return true;
+      }
+      return false;
+    } catch (error) {
+      this.log("error", `workspace-key-fetch-failed:${readableError(error)}`, peerId);
+      return false;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      peer.keyFetchPromise = null;
+    }
+  }
+
+  private async sendStaleKey(peerId: string, peer: PeerRecord): Promise<void> {
+    const version = this.workspaceKeys.currentVersion();
+    const context = peer.cryptoContext;
+    if (!version || !context || peer.channel?.readyState !== "open" || peer.accessRevoked) return;
+    this.waitForWorkspaceKey(peerId, peer);
+    const task = peer.syncSendQueue.then(async () => {
+      const header = this.createSyncHeader(peer, "stale-key", createSyncId(), this.nextSyncSeq(peer));
+      const sealed = await seal(
+        context.sessionKey,
+        new Uint8Array(),
+        buildSyncAad(header, context.localFingerprint, context.remoteFingerprint),
+      );
+      if (peer.channel?.readyState === "open" && !peer.disposed) {
+        peer.channel.send(JSON.stringify({ type: SYNC_TYPE, header, sealed: bytesToBase64(sealed) }));
+      }
+    });
+    peer.syncSendQueue = task.then(() => undefined, () => undefined);
+    await task;
+  }
+
+  private async wrapSyncOffer(peerId: string, peer: PeerRecord, offer: import("@zerocloud/shared").FileOfferMessage): Promise<string> {
+    const version = this.workspaceKeys.currentVersion();
+    const keySet = version ? this.workspaceKeys.get(version) : undefined;
+    const context = peer.cryptoContext;
+    if (!version || !keySet || !context || !this.isWorkspaceVerified(peer)) {
+      throw new Error("Peer is not workspace-verified for sync transfer");
+    }
+    const sealed = await seal(
+      keySet.syncKey,
+      utf8(JSON.stringify(offer)),
+      buildWorkspaceOfferAad(this.workspaceId, version, offer.transferId, context.localFingerprint, context.remoteFingerprint),
+    );
+    this.log("info", `sync-file-offer-sealed:${version}`, peerId);
+    return JSON.stringify({ type: "sync-file-offer", keyVersion: version, transferId: offer.transferId, sealed: bytesToBase64(sealed) });
+  }
+
   private async handleStringMessage(
     peerId: string,
     peer: PeerRecord,
@@ -810,6 +1119,10 @@ export class PeerManager {
     }
     if (isRecord(decoded) && decoded.type === SYNC_TYPE) {
       await this.handleSyncWire(peerId, peer, raw);
+      return;
+    }
+    if (isRecord(decoded) && decoded.type === "sync-file-offer") {
+      await this.handleSyncOffer(peerId, peer, decoded);
       return;
     }
     if (peer.handshakeState === "identity-mismatch") return;
@@ -846,14 +1159,14 @@ export class PeerManager {
     const parsed = dataChannelMessageSchema.safeParse(decoded);
     if (!parsed.success) return;
     if (parsed.data.type === "chat") {
-      if (peer.handshakeState !== "secure") return;
+      if (peer.handshakeState !== "secure" || !this.isWorkspaceVerified(peer)) return;
       this.events.emit("message", { peerId, message: parsed.data });
       this.log("info", "chat-received", peerId);
       return;
     }
     const control = fileControlMessageSchema.safeParse(parsed.data);
     if (!control.success) return;
-    if (peer.handshakeState !== "secure" || !peer.cryptoContext) {
+    if (peer.handshakeState !== "secure" || !peer.cryptoContext || !this.isWorkspaceVerified(peer)) {
       this.log("error", "file-control-before-secure-handshake", peerId);
       return;
     }
@@ -896,12 +1209,13 @@ export class PeerManager {
       this.log("error", "sync-envelope-invalid", peerId);
       return;
     }
+    if (peer.accessRevoked) {
+      peer.workspaceState = "no-access";
+      this.updateState(peerId, peer);
+      return;
+    }
     const { header, sealed } = parsed.message;
-    if (
-      peer.handshakeState !== "secure" ||
-      !peer.cryptoContext ||
-      !peer.directory?.role
-    ) {
+    if (peer.handshakeState !== "secure" || !peer.cryptoContext || !peer.directory?.role) {
       this.events.emit("syncRejected", {
         peerId,
         syncId: header.syncId,
@@ -915,18 +1229,99 @@ export class PeerManager {
     }
     try {
       const context = peer.cryptoContext;
-      const plaintext = await open(
+      const outerPlaintext = await open(
         context.sessionKey,
         base64ToBytes(sealed),
-        buildSyncAad(
-          header,
+        buildSyncAad(header, context.remoteFingerprint, context.localFingerprint),
+      );
+
+      if (header.messageType === "stale-key") {
+        if (outerPlaintext.byteLength !== 0) throw new Error("Stale-key message must have an empty plaintext");
+        peer.syncReceiveGuard.accept(header);
+        const currentVersion = this.workspaceKeys.currentVersion();
+        if (!currentVersion) return this.markNoWorkspaceAccess(peerId, peer, "workspace-key-unavailable");
+        if (header.keyVersion > currentVersion) {
+          this.waitForWorkspaceKey(peerId, peer);
+          const fetched = await this.fetchWorkspaceKeys(peerId, peer, header.keyVersion);
+          if (fetched) {
+            this.resetWorkspaceProof(peer);
+            await this.sendWorkspaceProof(peerId, peer);
+          } else this.waitForWorkspaceKey(peerId, peer);
+        } else {
+          this.waitForWorkspaceKey(peerId, peer);
+        }
+        this.log("info", `stale-key-received:${header.keyVersion}`, peerId);
+        return;
+      }
+
+      const currentVersion = this.workspaceKeys.currentVersion();
+      if (!currentVersion) return this.markNoWorkspaceAccess(peerId, peer, "workspace-key-unavailable");
+      if (header.messageType === "ws-proof") {
+        if (header.keyVersion < currentVersion) {
+          peer.syncReceiveGuard.accept(header);
+          await this.sendStaleKey(peerId, peer);
+          return;
+        }
+        if (header.keyVersion > currentVersion) {
+          this.waitForWorkspaceKey(peerId, peer);
+          const fetched = await this.fetchWorkspaceKeys(peerId, peer, header.keyVersion);
+          if (!fetched) {
+            await this.sendStaleKey(peerId, peer);
+            this.waitForWorkspaceKey(peerId, peer);
+            return;
+          }
+          const refreshedVersion = this.workspaceKeys.currentVersion();
+          if (refreshedVersion !== header.keyVersion) {
+            await this.sendStaleKey(peerId, peer);
+            return;
+          }
+        }
+        const keySet = this.workspaceKeys.get(header.keyVersion);
+        if (!keySet || !peer.localNonce || !peer.remoteNonce) {
+          await this.sendStaleKey(peerId, peer);
+          return;
+        }
+        const proof = await open(keySet.syncKey, new Uint8Array(outerPlaintext), buildSyncInnerAad(header));
+        const expected = await createWorkspaceProofDigest(
+          context.remoteNonce,
+          context.localNonce,
           context.remoteFingerprint,
           context.localFingerprint,
-        ),
-      );
-      if (plaintext.byteLength > MAX_SYNC_PLAINTEXT_BYTES) {
-        throw new Error("Sync plaintext exceeds 12,000 bytes");
+        );
+        if (!bytesEqual(proof, expected)) throw new Error("Workspace proof is invalid or reflected");
+        peer.syncReceiveGuard.accept(header);
+        peer.remoteProofVerifiedVersion = header.keyVersion;
+        peer.workspaceState = "verifying";
+        this.log("info", `workspace-proof-verified:${header.keyVersion}`, peerId);
+        if (peer.localProofSentVersion !== header.keyVersion) await this.sendWorkspaceProof(peerId, peer);
+        this.updateWorkspaceVerified(peerId, peer, header.keyVersion);
+        return;
       }
+
+      if (header.keyVersion > currentVersion) {
+        this.waitForWorkspaceKey(peerId, peer);
+        const fetched = await this.fetchWorkspaceKeys(peerId, peer, header.keyVersion);
+        if (fetched) {
+          this.resetWorkspaceProof(peer);
+          await this.sendWorkspaceProof(peerId, peer);
+        } else {
+          this.waitForWorkspaceKey(peerId, peer);
+        }
+        return;
+      }
+      if (header.keyVersion < currentVersion) {
+        await this.sendStaleKey(peerId, peer);
+        return;
+      }
+      if (header.keyVersion !== peer.workspaceVerifiedVersion) {
+        await this.sendStaleKey(peerId, peer);
+        return;
+      }
+      if (!this.isWorkspaceVerified(peer)) return;
+      const keySet = this.workspaceKeys.get(header.keyVersion);
+      if (!keySet) return this.markNoWorkspaceAccess(peerId, peer, "workspace-sync-key-unavailable");
+      const plaintext = await open(keySet.syncKey, new Uint8Array(outerPlaintext), buildSyncInnerAad(header));
+      if (plaintext.byteLength > MAX_SYNC_PLAINTEXT_BYTES) throw new Error("Sync inner plaintext exceeds 11 KiB");
       const decoded: unknown = JSON.parse(new TextDecoder().decode(plaintext));
       const message = syncPayloadSchema.parse(decoded);
       if (
@@ -950,6 +1345,44 @@ export class PeerManager {
         reason: readableError(error),
       });
       this.log("error", "sync-authentication-failed", peerId);
+      if (header.messageType === "ws-proof") this.markNoWorkspaceAccess(peerId, peer, "workspace-proof-failed");
+    }
+  }
+
+  private async handleSyncOffer(peerId: string, peer: PeerRecord, raw: unknown): Promise<void> {
+    const parsed = syncFileOfferSchema.safeParse(raw);
+    if (!parsed.success || !peer.cryptoContext || peer.handshakeState !== "secure") return;
+    if (peer.accessRevoked) return;
+    const envelope = parsed.data;
+    const currentVersion = this.workspaceKeys.currentVersion();
+    if (!currentVersion || envelope.keyVersion !== currentVersion || !this.isWorkspaceVerified(peer)) {
+      if (currentVersion && envelope.keyVersion > currentVersion) {
+        this.waitForWorkspaceKey(peerId, peer);
+        const fetched = await this.fetchWorkspaceKeys(peerId, peer, envelope.keyVersion);
+        if (!fetched) this.waitForWorkspaceKey(peerId, peer);
+      } else if (currentVersion && envelope.keyVersion < currentVersion) {
+        await this.sendStaleKey(peerId, peer);
+      }
+      this.log("error", `sync-offer-version-rejected:${envelope.keyVersion}`, peerId);
+      return;
+    }
+    const keySet = this.workspaceKeys.get(envelope.keyVersion);
+    if (!keySet) return;
+    try {
+      const plaintext = await open(
+        keySet.syncKey,
+        base64ToBytes(envelope.sealed),
+        buildWorkspaceOfferAad(this.workspaceId, envelope.keyVersion, envelope.transferId, peer.cryptoContext.remoteFingerprint, peer.cryptoContext.localFingerprint),
+      );
+      const offerValue: unknown = JSON.parse(new TextDecoder().decode(plaintext));
+      const offer = fileControlMessageSchema.safeParse(offerValue);
+      if (!offer.success || offer.data.type !== "file-offer" || offer.data.transferId !== envelope.transferId) {
+        throw new Error("Sync file offer does not match its authenticated header");
+      }
+      const receiver = this.getReceiver(peerId, peer.channel!, peer.cryptoContext);
+      await receiver.handleString(JSON.stringify(offer.data));
+    } catch (error) {
+      this.log("error", `sync-file-offer-authentication-failed:${readableError(error)}`, peerId);
     }
   }
 
@@ -1060,7 +1493,9 @@ export class PeerManager {
       this.getSender(peerId, channel, peer.cryptoContext);
       this.getReceiver(peerId, channel, peer.cryptoContext);
       this.log("info", "handshake-secure", peerId);
+      peer.workspaceState = "verifying";
       this.updateState(peerId, peer);
+      await this.sendWorkspaceProof(peerId, peer);
     } catch (error) {
       this.failHandshake(peerId, peer, readableError(error));
     }
@@ -1234,6 +1669,8 @@ export class PeerManager {
         peer.remoteFingerprint !== null &&
         this.verifiedFingerprints.has(peer.remoteFingerprint),
       handshakeError: peer.handshakeError,
+      workspaceState: peer.workspaceState,
+      workspaceVerifiedVersion: peer.workspaceVerifiedVersion,
     });
   }
 
@@ -1250,6 +1687,7 @@ export class PeerManager {
     peer.disposed = true;
     clearInterval(peer.statsTimer);
     if (peer.restartTimer) clearTimeout(peer.restartTimer);
+    if (peer.waitingTimer) clearTimeout(peer.waitingTimer);
     for (const removeListener of peer.removeChannelListeners.splice(0)) {
       removeListener();
     }

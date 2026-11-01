@@ -78,7 +78,9 @@ Request bodies and path parameters are validated with Zod. Responses use `{ "err
 | SHA-256                           | Identity fingerprints and final plaintext file integrity check                            |
 | ECDH + HKDF-SHA-256               | Derive a key-wrapping key from the wrapper and recipient identity keys                    |
 | AES-256-GCM wrapped workspace key | Seal the 256-bit workspace key with workspace ID, version, and both fingerprints in AAD   |
-| AES-256-GCM workspace key         | Seal the workspace name with `zerocloud/v1/ws-name` and workspace ID as AAD               |
+| HKDF-SHA-256                      | Derive version-specific `ws-name` and `ws-sync` keys from each workspace key and version  |
+| AES-256-GCM derived name key      | Seal the workspace name with `zerocloud/v1/ws-name`, workspace ID, and key version as AAD |
+| AES-256-GCM derived sync key      | Prove current workspace-key possession and inner-seal sync data and sync-purpose file offers |
 | HKDF-SHA-256 invite key           | Derive an invite-scoped sealing key from the URL-fragment secret and invite ID            |
 | AES-256-GCM invite envelope       | Seal the workspace key for invite redemption, bound to workspace, invite, and key version |
 
@@ -86,7 +88,13 @@ Each DataChannel exchanges one hello containing an algorithm, public key, and fr
 
 Handshake state flow: workspace-authenticated → joined with peer directory → WebRTC offer/answer and ICE → DataChannel hello with nonce → compare hello fingerprint against the directory → derive the Phase 4 session key → exchange nonce/fingerprint-bound sealed `ready` messages → secure. A directory mismatch is marked identity mismatch and blocks chat/file handling for that peer. Failure to validate or confirm the handshake never reaches the secure state.
 
-Workspace wrapping derives ECDH bits from the wrapper's private key and recipient's public key. Sorted, length-prefixed public keys feed the SHA-256 HKDF salt; the HKDF info is `zerocloud/v1/wrap`. The wrap envelope AAD binds the workspace ID, uint32 key version, wrapper fingerprint, and recipient fingerprint. Self-wrap is supported. Name sealing uses AAD formed from `zerocloud/v1/ws-name` followed by the workspace ID.
+Workspace wrapping derives ECDH bits from the wrapper's private key and recipient's public key. Sorted, length-prefixed public keys feed the SHA-256 HKDF salt; the HKDF info is `zerocloud/v1/wrap`. The wrap envelope AAD binds the workspace ID, uint32 key version, wrapper fingerprint, and recipient fingerprint. Self-wrap is supported. A workspace key derives separate, non-extractable AES-GCM keys for name and sync use with HKDF-SHA-256, workspace UUID salt, and purpose/version-specific info. Names use AAD `zerocloud/v1/ws-name || rawWorkspaceUUID || uint32(keyVersion)`. Version-1 names written by the earlier raw-key scheme are read through a compatibility fallback and will be rewritten under the derived name key during the next rotation.
+
+### Checkpoint A: workspace key rotation
+
+The owner can rotate a workspace key or remove a member with a new key in one database transaction. Rotation replaces the sealed workspace name and inserts a wrapped new key for every current member, increments `current_key_version`, clears `needs_rotation`, and revokes pending invites. The member-removal route rejects requests without the full rotation payload; it removes that member's wraps and membership in the same transaction. Old key versions remain available to current members so they can still read earlier workspace content. The authenticated API exposes each member's wraps only to that member and the workspace's current version metadata only to workspace members.
+
+Members can leave through `POST /workspaces/:id/leave`. Their membership and wraps are deleted, `needs_rotation` is set, and the owner receives a live rotation-needed event. The owner must rotate before new content is protected from the departed member's old key. Pending invites are accepted only while their key version remains current. The browser keeps imported workspace keys in a memory-only keyring; IndexedDB stores only TOFU pins of member public keys. A pin mismatch blocks rotation until an owner explicitly reviews and updates the pin after checking the fingerprint out of band. Rotation confirmation presents recipient fingerprints and asks the owner to confirm unverified recipients.
 
 ## Roles and authenticated signaling
 
@@ -94,7 +102,9 @@ Roles are `owner` (workspace creator), `editor` (send and receive), and `viewer`
 
 The sender UI disables file sending for viewers. Receivers automatically reject offers from a viewer or a peer with unknown role using `no write permission`. This is cooperative protection among honest clients; a modified client can bypass its own UI checks. The directory comes from the server, so out-of-band fingerprint verification remains important against a malicious server. The server sees the social graph: who belongs to which workspace and when members are online.
 
-Removing a member will not rotate the workspace key in this phase. **Removed members still hold the old workspace key until key rotation is implemented.**
+After removal or leave, old keys and files already received cannot be erased. Rotating the key protects new content from a removed member, but the server cannot make a departed device forget prior plaintext or keys.
+
+Chat remains protected by WebRTC DTLS and the authenticated transport session only; it is not encrypted under the workspace key.
 
 ## Workspace peer and file-transfer testing
 
@@ -123,9 +133,9 @@ Sync message payloads (inside the encrypted envelope):
 | `pull-request` | `requestId`, `fileId`, expected SHA-256                                 | Request a particular local blob from a peer             |
 | `pull-denied`  | `requestId`, `not-found`, `hash-mismatch`, or `forbidden`               | Explain why the requested blob cannot be sent           |
 
-The DataChannel wire form is `{ type: "sync", header, sealed }`. The strict, cleartext header contains exactly `{ v: 1, messageType, workspaceId, syncId, partIndex, totalParts, seq }`. It contains no file names, hashes, sizes, file IDs, or entries. Header fields are validated before decryption; messages for another workspace are silently dropped. The receiver builds AES-GCM AAD from the received header and the sender/receiver fingerprints bound by the Phase 4 key-confirmed peer connection, in this order: `zerocloud/v1/sync || messageType || workspaceId || syncId || partIndex || totalParts || seq || senderFingerprint || receiverFingerprint`. Changing any authenticated value causes decryption to fail.
+The DataChannel wire form is `{ type: "sync", header, sealed }`. The strict, cleartext header contains exactly `{ v: 1, messageType, workspaceId, syncId, partIndex, totalParts, seq, keyVersion }`. It contains no file names, hashes, sizes, file IDs, or entries. Header fields are validated before decryption; messages for another workspace are silently dropped. The receiver builds AES-GCM AAD from the received header and the sender/receiver fingerprints bound by the Phase 4 key-confirmed peer connection, in this order: `zerocloud/v1/sync || messageType || workspaceId || syncId || partIndex || totalParts || seq || keyVersion || senderFingerprint || receiverFingerprint`. Changing any authenticated value causes decryption to fail.
 
-`seq` is a per-sender, per-connection counter beginning at 1. A message group increments it once; all fragments of one manifest share that sequence. Receivers reject any sequence at or below the highest accepted sequence, except distinct fragment indexes in that same manifest group. A new peer connection has a fresh Phase 4 session key and reset counters. Manifest assembly is keyed by peer connection and sync ID, bounded to 1 MB and 64 fragments, expires incomplete assemblies after 30 seconds, and discards an assembly if a part fails authentication. Wire messages including the header are capped at 16 KiB. The encrypted channel also uses WebRTC DTLS.
+`seq` is a per-sender, per-connection counter beginning at 1. A message group increments it once; all fragments of one manifest share that sequence. Receivers reject any sequence at or below the highest accepted sequence, except distinct fragment indexes in that same manifest group. A new peer connection has a fresh Phase 4 session key and reset counters. Manifest assembly is keyed by peer connection and sync ID, bounded to 1 MB and 128 fragments, expires incomplete assemblies after 30 seconds, and discards an assembly if a part fails authentication. Wire messages including the header are capped at 16 KiB. The encrypted channel also uses WebRTC DTLS.
 
 ```mermaid
 sequenceDiagram
@@ -150,17 +160,37 @@ Known Phase 6 limitations:
 - Entry authorship is not signed. A malicious workspace writer could forge another writer's fingerprint in metadata.
 - Local IndexedDB blobs are plaintext at rest.
 - Sync runs only while browser tabs are open; there is no background sync.
-- Removed members retain files and keys they already copied; key rotation is out of scope.
+- Members retain files and keys they copied before removal; rotation protects only new content.
 - The cleartext sync header (message type, workspace ID, fragment count/index and sequence) is visible only to the peer browser; sync messages do not pass through the signalling server. DataChannels are additionally protected by DTLS.
 - The signalling server learns which members are online in each workspace, but never receives filenames, file sizes, hashes, manifests, or file contents.
 
 To verify sync locally, open the same workspace in two authenticated browser profiles, join from both, wait until each peer shows `in sync`, then upload a file in **Files**. The other profile should show the file progressing from queued/pulling to synced; download it there and compare its digest with `sha256sum`. Close one profile, make a change in the other, then reopen and rejoin the first profile to verify manifest catch-up. The development-only random operations control runs for at most 60 seconds and the state hash appears in the peer debug panel.
 
+## Phase 7 Checkpoint B: workspace-key-gated data plane
+
+Each secure peer connection must prove possession of the current workspace sync key in both directions before sync, file transfer, or chat is enabled. A `ws-proof` message is inner-sealed with the version-specific workspace sync key and then outer-sealed with the Phase 4 session key. Its plaintext is a SHA-256 digest over the protocol label, independently sorted connection nonces, and ordered sender/receiver fingerprints. The sender nonce is also included as a direction marker so reflecting a proof fails even when two tabs share the same browser identity and fingerprint.
+
+Ordinary sync payloads use two encryption layers: the workspace sync key seals the payload with AAD `zerocloud/v1/ws-inner || workspaceId || uint32(keyVersion) || messageType || syncId || partIndex || totalParts`; the Phase 4 session key seals that ciphertext with the outer sync header and peer-fingerprint AAD described above. Sync-purpose file offers are similarly workspace-key sealed and bound to workspace, key version, transfer ID, and sender/receiver fingerprints before being sent over the session-protected DataChannel. Quick Send stays outside workspace-key encryption and is disabled for peers that have not proved the current workspace key.
+
+The `stale-key` control carries an empty plaintext protected by the outer session seal. Its key version and sequence are authenticated and it uses the same replay counter as other sync messages. When a peer reports a newer version, the browser waits up to 30 seconds for the workspace key and attempts one key refresh with a 10-second timeout; successful refresh restarts proof at the new version. Rotation immediately invalidates existing proof state. A peer removed from the workspace is marked no-access locally and its active transfers are stopped.
+
+The protocol retains the 500-entry manifest and existing name/field limits. Fragment plaintext is at most 11 KiB, fragments are capped at 128, complete manifests are capped at 1 MiB, and each wire envelope is capped at 16 KiB. Incomplete assemblies expire after 30 seconds.
+
+Known Checkpoint B limitations:
+
+- The sync header (including message type, workspace ID, key version, sequence, and fragment sizes/counts) is visible to the peer browser, never the signalling server. DataChannels are additionally protected by DTLS.
+- Chat is protected by DTLS and the transport session only, not by the workspace key. Clients disable chat to and from peers not verified at the current workspace key version.
+- Workspace-key possession proves access to the current key, not that a peer is honest or that previously copied content has been erased. Removed members may collude with a remaining member who shares the new key.
+- Key fetch and verification require an open, authenticated browser session. A missing key, denied key fetch, or failed proof leaves that peer without workspace data-plane access.
+
+To test Checkpoint B, join the same workspace from two authenticated browser profiles and wait for both rows to show workspace verified. Confirm sync and chat become available only after that state. Rotate the workspace key and verify both remaining profiles re-prove at the new version. Remove a member with rotation and verify its peer row becomes no-access and transfers stop. `NEXT_PUBLIC_DEBUG_IGNORE_KICK=true` and `NEXT_PUBLIC_DEBUG_BLOCK_KEYFETCH=true` are development-only switches for exercising stale-key timeout behavior.
+
 ## Tests and known limitations
 
 Run `pnpm test`, `pnpm typecheck`, and `pnpm lint`. API tests use `TEST_DATABASE_URL` and truncate tables between tests; never point it at a development or production database. Workspace crypto tests use Node WebCrypto and cover X25519/P-256 wrapping, self-wrap, wrong recipients, AAD tampering, sealed names, and invite-key sealing with correct and incorrect secrets.
 
-- No key recovery, key backup, password reset, email verification, multi-device identity, or key rotation.
+- No key recovery, key backup, password reset, email verification, or multi-device identity.
+- Chat is protected by DTLS and the transport session only, not by the workspace key.
 - Registration binds the submitted public key but does not prove private-key possession.
 - JWTs in `sessionStorage` are exposed to JavaScript executing through XSS.
 - Data-plane role enforcement is cooperative among honest clients.

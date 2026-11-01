@@ -71,7 +71,7 @@ function InviteJoin() {
         );
         if (record.nameSealed)
           setWorkspaceName(
-            await openWorkspaceName(key, record.workspaceId, record.nameSealed),
+            await openWorkspaceName(key, record.workspaceId, record.nameSealed, record.keyVersion),
           );
       })
       .catch((caught: unknown) =>

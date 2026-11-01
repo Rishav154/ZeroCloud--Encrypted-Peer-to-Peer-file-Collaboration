@@ -50,7 +50,7 @@ describe("ManifestAssembler", () => {
   it("discards inconsistent and out-of-range fragments", () => {
     const assembler = new ManifestAssembler();
     const [first, second] = fragments();
-    expect(() => assembler.add("peer", { ...first!, totalParts: 65 })).toThrow(
+    expect(() => assembler.add("peer", { ...first!, totalParts: 129 })).toThrow(
       "exceeds limits",
     );
     assembler.add("peer", first!);

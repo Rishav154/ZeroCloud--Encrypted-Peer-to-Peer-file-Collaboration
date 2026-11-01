@@ -3,6 +3,7 @@ import { open, seal } from "../crypto/seal.js";
 import {
   assembleManifest,
   buildSyncAad,
+  buildSyncInnerAad,
   createSyncId,
   fragmentManifest,
   MAX_SYNC_WIRE_BYTES,
@@ -75,12 +76,48 @@ describe("manifest fragmentation", () => {
     expect(createSyncId(new Uint8Array(16).fill(0xab))).toBe("ab".repeat(16));
     expect(() => createSyncId(new Uint8Array(15))).toThrow("16 random bytes");
   });
+
+  it("round-trips the largest valid worst-case escaped manifest within the 128-part cap", () => {
+    const escapedName = (`"\\`).repeat(127) + `"`;
+    const escapedAuthor = (`"\\`).repeat(40);
+    const entries: FileEntry[] = Array.from({ length: 500 }, (_, index) => ({
+      fileId: `10000000-0000-4000-8000-${(index + 1).toString().padStart(12, "0")}`,
+      name: escapedName,
+      size: index,
+      sha256: "f".repeat(64),
+      lamport: index + 1,
+      author: "e".repeat(64),
+      authorName: escapedAuthor,
+      modifiedAt: index + 1,
+      deleted: false,
+    }));
+    const fragments = fragmentManifest(entries, "fa".repeat(16));
+    expect(fragments.length).toBeLessThanOrEqual(128);
+    expect(fragments.every((fragment) => new TextEncoder().encode(JSON.stringify(fragment)).byteLength <= MAX_SYNC_PLAINTEXT_BYTES)).toBe(true);
+    expect(assembleManifest(fragments)).toEqual(entries);
+  });
+
+  it("rejects an aggregate manifest over 1 MiB without loosening entry limits", () => {
+    const valid = fragmentManifest([entry(1)], "fb".repeat(16));
+    const oversizedFragments = valid.map((fragment) => ({
+      ...fragment,
+      entries: Array.from({ length: 500 }, (_, index) => ({
+        ...entry(index + 1),
+        privateExtra: "x".repeat(2200),
+      })),
+      totalParts: 1,
+      partIndex: 0,
+    }));
+    expect(() => assembleManifest(oversizedFragments as unknown as typeof valid)).toThrow("1 MB");
+    expect(manifestFragmentSchema.safeParse({ ...valid[0]!, totalParts: 129 }).success).toBe(false);
+  });
 });
 
 const baseHeader: SyncHeader = {
   v: 1,
   messageType: "manifest",
   workspaceId: "00000000-0000-4000-8000-000000000099",
+  keyVersion: 1,
   syncId: "d4".repeat(16),
   partIndex: 0,
   totalParts: 1,
@@ -109,6 +146,7 @@ describe("sync AAD and envelope checks", () => {
       { ...baseHeader, partIndex: 1, totalParts: 2 },
       { ...baseHeader, totalParts: 2 },
       { ...baseHeader, seq: 2 },
+      { ...baseHeader, keyVersion: 2 },
     ];
     for (const mutated of mutations) {
       await expect(
@@ -177,6 +215,7 @@ describe("sync AAD and envelope checks", () => {
     expect(
       syncHeaderSchema.safeParse({ ...baseHeader, extra: "nope" }).success,
     ).toBe(false);
+    expect(syncHeaderSchema.safeParse({ ...baseHeader, totalParts: MAX_SYNC_PARTS + 1 }).success).toBe(false);
     expect(
       syncWireMessageSchema.safeParse({
         type: "sync",
@@ -199,5 +238,12 @@ describe("sync AAD and envelope checks", () => {
       baseHeader.workspaceId,
     );
     expect(oversize).toEqual({ ok: false, reason: "oversize" });
+  });
+
+  it("binds inner workspace ciphertext to its key version and message fields", async () => {
+    const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    const sealed = await seal(key, new TextEncoder().encode("workspace metadata"), buildSyncInnerAad(baseHeader));
+    await expect(open(key, sealed, buildSyncInnerAad({ ...baseHeader, keyVersion: 2 }))).rejects.toThrow();
+    await expect(open(key, sealed, buildSyncInnerAad({ ...baseHeader, syncId: "a8".repeat(16) }))).rejects.toThrow();
   });
 });

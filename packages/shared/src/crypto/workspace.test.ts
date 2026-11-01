@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  concatBytes,
+  bytesToBase64,
+  createWorkspaceProofDigest,
+  deriveWorkspaceNameKey,
+  deriveWorkspaceSyncKey,
   fingerprintPublicKey,
   generateIdentityKeyPair,
   generateWorkspaceKey,
@@ -9,7 +14,9 @@ import {
   sealInviteWorkspaceKey,
   unwrapWorkspaceKey,
   wrapWorkspaceKey,
+  utf8,
 } from "./index.js";
+import { seal } from "./seal.js";
 
 async function keyBytes(key: CryptoKey): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.exportKey("raw", key));
@@ -39,6 +46,17 @@ async function makeContext(
 }
 
 describe("workspace key wrapping", () => {
+  it("rejects a reflected workspace proof, including same-identity tabs", async () => {
+    const firstNonce = new Uint8Array(32).fill(11);
+    const secondNonce = new Uint8Array(32).fill(29);
+    const sharedFingerprint = "a".repeat(64);
+    const sent = await createWorkspaceProofDigest(firstNonce, secondNonce, sharedFingerprint, sharedFingerprint);
+    const reflected = await createWorkspaceProofDigest(secondNonce, firstNonce, sharedFingerprint, sharedFingerprint);
+    expect(sent).not.toEqual(reflected);
+    const different = await createWorkspaceProofDigest(secondNonce, firstNonce, "b".repeat(64), "a".repeat(64));
+    expect(sent).not.toEqual(different);
+  });
+
   it.each(["X25519", "P-256"] as const)(
     "wraps and unwraps with %s, including self-wrap",
     async (algorithm) => {
@@ -121,6 +139,64 @@ describe("workspace key wrapping", () => {
     await expect(
       openWorkspaceName(key, crypto.randomUUID(), sealed),
     ).rejects.toThrow();
+  });
+
+  it("derives deterministic workspace keys that differ by version and workspace", async () => {
+    const key = await generateWorkspaceKey();
+    const workspaceId = crypto.randomUUID();
+    const syncA = await deriveWorkspaceSyncKey(key, workspaceId, 1);
+    const syncAAgain = await deriveWorkspaceSyncKey(key, workspaceId, 1);
+    const syncVersion2 = await deriveWorkspaceSyncKey(key, workspaceId, 2);
+    const syncOtherWorkspace = await deriveWorkspaceSyncKey(
+      key,
+      crypto.randomUUID(),
+      1,
+    );
+    const probe = new Uint8Array([1, 2, 3]);
+    const iv = new Uint8Array(12).fill(7);
+    const aad = new Uint8Array([9]);
+    const encrypt = (derived: CryptoKey): Promise<ArrayBuffer> =>
+      crypto.subtle.encrypt(
+        { name: "AES-GCM", iv, additionalData: aad },
+        derived,
+        probe,
+      );
+    expect(new Uint8Array(await encrypt(syncA))).toEqual(
+      new Uint8Array(await encrypt(syncAAgain)),
+    );
+    expect(new Uint8Array(await encrypt(syncA))).not.toEqual(
+      new Uint8Array(await encrypt(syncVersion2)),
+    );
+    expect(new Uint8Array(await encrypt(syncA))).not.toEqual(
+      new Uint8Array(await encrypt(syncOtherWorkspace)),
+    );
+    expect(syncA.extractable).toBe(false);
+    const nameA = await deriveWorkspaceNameKey(key, workspaceId, 1);
+    const nameB = await deriveWorkspaceNameKey(key, workspaceId, 1);
+    expect(new Uint8Array(await encrypt(nameA))).toEqual(
+      new Uint8Array(await encrypt(nameB)),
+    );
+  });
+
+  it("opens legacy v1 names and writes versioned names with version-bound AAD", async () => {
+    const key = await generateWorkspaceKey();
+    const workspaceId = crypto.randomUUID();
+    const legacy = await seal(
+      key,
+      utf8("Legacy name"),
+      concatBytes(utf8("zerocloud/v1/ws-name"), utf8(workspaceId)),
+    );
+    const legacyBase64 = bytesToBase64(legacy);
+    await expect(
+      openWorkspaceName(key, workspaceId, legacyBase64, 1),
+    ).resolves.toBe("Legacy name");
+
+    const v2 = await sealWorkspaceName(key, workspaceId, "Rotated name", 2);
+    await expect(openWorkspaceName(key, workspaceId, v2, 2)).resolves.toBe(
+      "Rotated name",
+    );
+    await expect(openWorkspaceName(key, workspaceId, v2, 3)).rejects.toThrow();
+    await expect(openWorkspaceName(key, crypto.randomUUID(), v2, 2)).rejects.toThrow();
   });
 
   it("opens invite envelopes only with the right secret and context", async () => {

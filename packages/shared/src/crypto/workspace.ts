@@ -14,6 +14,8 @@ const WRAP_SALT_PREFIX = utf8("zerocloud/v1/wrap-salt");
 const WRAP_INFO = utf8("zerocloud/v1/wrap");
 const WRAPPED_KEY_AAD_PREFIX = utf8("zerocloud/v1/wrapped-ws-key");
 const WORKSPACE_NAME_AAD_PREFIX = utf8("zerocloud/v1/ws-name");
+const WORKSPACE_SYNC_INFO_PREFIX = utf8("zerocloud/v1/ws-sync");
+const WORKSPACE_NAME_INFO_PREFIX = utf8("zerocloud/v1/ws-name");
 const INVITE_INFO = utf8("zerocloud/v1/invite");
 const INVITE_KEY_AAD_PREFIX = utf8("zerocloud/v1/invite-key");
 
@@ -34,16 +36,135 @@ export async function generateWorkspaceKey(): Promise<CryptoKey> {
   ]);
 }
 
-function nameAad(workspaceId: string): Uint8Array {
+function legacyNameAad(workspaceId: string): Uint8Array {
   return concatBytes(WORKSPACE_NAME_AAD_PREFIX, utf8(workspaceId));
+}
+
+function versionBytes(version: number): Uint8Array {
+  if (!Number.isInteger(version) || version < 1 || version > 0xffffffff) {
+    throw new RangeError("Key version must be a positive uint32 integer");
+  }
+  const bytes = new Uint8Array(4);
+  new DataView(bytes.buffer).setUint32(0, version, false);
+  return bytes;
+}
+
+function versionedNameAad(workspaceId: string, version: number): Uint8Array {
+  return concatBytes(
+    WORKSPACE_NAME_AAD_PREFIX,
+    uuidBytes(workspaceId),
+    versionBytes(version),
+  );
+}
+
+async function deriveWorkspaceKey(
+  workspaceKey: CryptoKey,
+  workspaceId: string,
+  version: number,
+  label: Uint8Array,
+): Promise<CryptoKey> {
+  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", workspaceKey));
+  try {
+    const hkdfKey = await crypto.subtle.importKey("raw", raw, "HKDF", false, [
+      "deriveKey",
+    ]);
+    return await crypto.subtle.deriveKey(
+      {
+        name: "HKDF",
+        hash: "SHA-256",
+        salt: toArrayBuffer(uuidBytes(workspaceId)),
+        info: toArrayBuffer(concatBytes(label, versionBytes(version))),
+      },
+      hkdfKey,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"],
+    );
+  } finally {
+    raw.fill(0);
+  }
+}
+
+export function deriveWorkspaceSyncKey(
+  workspaceKey: CryptoKey,
+  workspaceId: string,
+  version: number,
+): Promise<CryptoKey> {
+  return deriveWorkspaceKey(
+    workspaceKey,
+    workspaceId,
+    version,
+    WORKSPACE_SYNC_INFO_PREFIX,
+  );
+}
+
+export function deriveWorkspaceNameKey(
+  workspaceKey: CryptoKey,
+  workspaceId: string,
+  version: number,
+): Promise<CryptoKey> {
+  return deriveWorkspaceKey(
+    workspaceKey,
+    workspaceId,
+    version,
+    WORKSPACE_NAME_INFO_PREFIX,
+  );
+}
+
+export async function createWorkspaceProofDigest(
+  senderNonce: Uint8Array,
+  receiverNonce: Uint8Array,
+  senderFingerprint: string,
+  receiverFingerprint: string,
+): Promise<Uint8Array> {
+  if (senderNonce.byteLength !== 32 || receiverNonce.byteLength !== 32) {
+    throw new Error("Workspace proof requires two 32-byte handshake nonces");
+  }
+  const sortedNonces = [senderNonce, receiverNonce].sort(compareBytes);
+  // Sender nonce binds direction even when both tabs share one identity fingerprint.
+  const material = concatBytes(
+    utf8("zerocloud/v1/ws-proof"),
+    ...sortedNonces,
+    utf8(senderFingerprint),
+    utf8(receiverFingerprint),
+    senderNonce,
+  );
+  const digest = await crypto.subtle.digest("SHA-256", toArrayBuffer(material));
+  return new Uint8Array(digest);
+}
+
+export function buildWorkspaceOfferAad(
+  workspaceId: string,
+  keyVersion: number,
+  transferId: number,
+  senderFingerprint: string,
+  receiverFingerprint: string,
+): Uint8Array {
+  if (!Number.isInteger(transferId) || transferId < 1 || transferId > 0xffffffff) {
+    throw new RangeError("Transfer ID must be a positive uint32 integer");
+  }
+  return concatBytes(
+    utf8("zerocloud/v1/ws-sync-offer"),
+    uuidBytes(workspaceId),
+    versionBytes(keyVersion),
+    versionBytes(transferId),
+    utf8(senderFingerprint),
+    utf8(receiverFingerprint),
+  );
 }
 
 export async function sealWorkspaceName(
   key: CryptoKey,
   workspaceId: string,
   name: string,
+  version = 1,
 ): Promise<string> {
-  const envelope = await seal(key, utf8(name), nameAad(workspaceId));
+  const nameKey = await deriveWorkspaceNameKey(key, workspaceId, version);
+  const envelope = await seal(
+    nameKey,
+    utf8(name),
+    versionedNameAad(workspaceId, version),
+  );
   return bytesToBase64(envelope);
 }
 
@@ -51,13 +172,22 @@ export async function openWorkspaceName(
   key: CryptoKey,
   workspaceId: string,
   sealed: string,
+  version = 1,
 ): Promise<string> {
-  const plaintext = await open(
-    key,
-    base64ToBytes(sealed),
-    nameAad(workspaceId),
-  );
-  return new TextDecoder().decode(plaintext);
+  const envelope = base64ToBytes(sealed);
+  try {
+    const nameKey = await deriveWorkspaceNameKey(key, workspaceId, version);
+    const plaintext = await open(
+      nameKey,
+      envelope,
+      versionedNameAad(workspaceId, version),
+    );
+    return new TextDecoder().decode(plaintext);
+  } catch (error) {
+    if (version !== 1) throw error;
+    const legacyPlaintext = await open(key, envelope, legacyNameAad(workspaceId));
+    return new TextDecoder().decode(legacyPlaintext);
+  }
 }
 
 function validateContext(context: WrapContext): void {
