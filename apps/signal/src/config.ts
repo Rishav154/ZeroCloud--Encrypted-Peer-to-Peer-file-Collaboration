@@ -7,6 +7,9 @@ const environmentSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(4000),
   DATABASE_URL: z.string().url(),
   ALLOWED_ORIGIN: z.string().url(),
+  WEB_ORIGIN: z.string().url(),
+  JWT_SECRET: z.string().min(32),
+  TEST_DATABASE_URL: z.string().url().optional(),
 });
 
 const result = environmentSchema.safeParse(process.env);

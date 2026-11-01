@@ -12,12 +12,31 @@ export const pongSchema = z.object({
   serverTime: z.number(),
 });
 
-export const roomIdSchema = z
-  .string()
-  .min(1)
-  .max(64)
-  .regex(/^[a-zA-Z0-9_-]+$/);
 export const peerIdSchema = z.string().uuid();
+export const workspaceIdSchema = z.string().uuid();
+export const userIdSchema = z.string().uuid();
+export const workspaceRoleSchema = z.enum(["owner", "editor", "viewer"]);
+
+export const peerDirectoryEntrySchema = z.object({
+  peerId: peerIdSchema,
+  userId: userIdSchema,
+  displayName: z.string().min(1).max(80),
+  role: workspaceRoleSchema,
+  fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+});
+
+export const workspaceMemberDirectorySchema = z.object({
+  userId: userIdSchema,
+  displayName: z.string().min(1).max(80),
+  role: workspaceRoleSchema,
+  fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  publicKey: z.string().min(1),
+});
+
+export const authSignalSchema = z.object({
+  type: z.literal("auth"),
+  token: z.string().min(1),
+});
 
 export const offerSignalSchema = z.object({
   kind: z.enum(["offer", "answer"]),
@@ -38,7 +57,7 @@ export const signalDataSchema = z.union([offerSignalSchema, iceSignalSchema]);
 
 export const joinSchema = z.object({
   type: z.literal("join"),
-  roomId: roomIdSchema,
+  workspaceId: workspaceIdSchema,
   peerId: peerIdSchema,
 });
 
@@ -51,6 +70,7 @@ export const relaySignalSchema = z.object({
 });
 
 export const clientMessageSchema = z.union([
+  authSignalSchema,
   pingSchema,
   joinSchema,
   leaveSchema,
@@ -60,12 +80,13 @@ export const clientMessageSchema = z.union([
 export const joinedSchema = z.object({
   type: z.literal("joined"),
   peerId: peerIdSchema,
-  peers: z.array(peerIdSchema),
+  workspaceId: workspaceIdSchema,
+  peers: z.array(peerDirectoryEntrySchema),
 });
 
 export const peerJoinedSchema = z.object({
   type: z.literal("peer-joined"),
-  peerId: peerIdSchema,
+  peer: peerDirectoryEntrySchema,
 });
 
 export const peerLeftSchema = z.object({
@@ -79,6 +100,33 @@ export const forwardedSignalSchema = z.object({
   data: signalDataSchema,
 });
 
+export const authenticatedSchema = z.object({
+  type: z.literal("authenticated"),
+  userId: userIdSchema,
+});
+
+export const memberAddedSchema = z.object({
+  type: z.literal("member-added"),
+  member: workspaceMemberDirectorySchema,
+});
+
+export const memberRemovedSchema = z.object({
+  type: z.literal("member-removed"),
+  userId: userIdSchema,
+});
+
+export const roleChangedSchema = z.object({
+  type: z.literal("role-changed"),
+  userId: userIdSchema,
+  role: z.enum(["editor", "viewer"]),
+});
+
+export const kickedSchema = z.object({
+  type: z.literal("kicked"),
+  workspaceId: workspaceIdSchema,
+  message: z.string(),
+});
+
 export const errorMessageSchema = z.object({
   type: z.literal("error"),
   code: z.string(),
@@ -87,10 +135,15 @@ export const errorMessageSchema = z.object({
 
 export const serverMessageSchema = z.union([
   pongSchema,
+  authenticatedSchema,
   joinedSchema,
   peerJoinedSchema,
   peerLeftSchema,
   forwardedSignalSchema,
+  memberAddedSchema,
+  memberRemovedSchema,
+  roleChangedSchema,
+  kickedSchema,
   errorMessageSchema,
 ]);
 
@@ -257,6 +310,11 @@ export type ClientSignalMessage = z.infer<typeof clientMessageSchema>;
 export type ServerSignalMessage = z.infer<typeof serverMessageSchema>;
 export type SignalMessage = z.infer<typeof signalMessageSchema>;
 export type ChatMessage = z.infer<typeof chatMessageSchema>;
+export type PeerDirectoryEntry = z.infer<typeof peerDirectoryEntrySchema>;
+export type WorkspaceMemberDirectory = z.infer<
+  typeof workspaceMemberDirectorySchema
+>;
+export type WorkspaceRole = z.infer<typeof workspaceRoleSchema>;
 
 export type ParseMessageResult<T> =
   { success: true; data: T } | { success: false; error: string };

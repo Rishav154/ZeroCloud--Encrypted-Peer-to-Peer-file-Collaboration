@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   MAX_FILE_SIZE,
-  roomIdSchema,
   type ClientSignalMessage,
   type ServerSignalMessage,
 } from "@zerocloud/shared";
@@ -17,8 +16,9 @@ import {
   type StoredIdentity,
 } from "../lib/identity/identityStore";
 import { useSignalSocket } from "./use-signal-socket";
+import { useAuthStore } from "../lib/auth/session";
 
-type ActiveSession = { roomId: string; peerId: string };
+type ActiveSession = { workspaceId: string; peerId: string };
 type IdentityView = {
   algorithm: StoredIdentity["algorithm"];
   fingerprint: string;
@@ -37,15 +37,18 @@ function recordEvent(
   });
 }
 
-export function usePeerSession(): {
+export function usePeerSession(
+  workspaceId: string,
+  localRole: "owner" | "editor" | "viewer",
+): {
   peerId: string | null;
   identity: IdentityView | null;
   identityError: string | null;
-  activeRoomId: string | null;
+  activeWorkspaceId: string | null;
   isJoined: boolean;
   openPeerCount: number;
-  joinRoom: (roomId: string) => void;
-  leaveRoom: () => void;
+  joinWorkspace: () => void;
+  leaveWorkspace: () => void;
   sendChat: (text: string) => boolean;
   sendFile: (file: File, peerId: string | "all") => number;
   acceptTransfer: (peerId: string, transferId: number) => void;
@@ -59,7 +62,7 @@ export function usePeerSession(): {
   verifyPeer: (peerId: string) => Promise<void>;
 } {
   const peerId = usePeerStore((state) => state.peerId);
-  const activeRoomId = usePeerStore((state) => state.activeRoomId);
+  const activeWorkspaceId = usePeerStore((state) => state.activeWorkspaceId);
   const isJoined = usePeerStore((state) => state.isJoined);
   const openPeerCount = usePeerStore(
     (state) =>
@@ -79,6 +82,7 @@ export function usePeerSession(): {
   const [identity, setIdentity] = useState<IdentityView | null>(null);
   const [identityError, setIdentityError] = useState<string | null>(null);
   const setPeerId = usePeerStore((state) => state.setPeerId);
+  const accessToken = useAuthStore((state) => state.accessToken);
 
   useEffect(() => {
     if (!peerId) setPeerId(crypto.randomUUID());
@@ -136,17 +140,32 @@ export function usePeerSession(): {
         if (!active || active.peerId !== message.peerId) return;
         store.setJoined(true);
         store.setError(null);
-        recordEvent(`joined-room:${active.roomId}`);
-        for (const remotePeerId of message.peers) {
-          manager?.addPeer(remotePeerId);
-          void manager?.connectToPeer(remotePeerId);
+        for (const peer of message.peers)
+          store.setMember({
+            userId: peer.userId,
+            displayName: peer.displayName,
+            role: peer.role,
+            fingerprint: peer.fingerprint,
+            publicKey: "",
+          });
+        recordEvent(`joined-workspace:${active.workspaceId}`);
+        for (const peer of message.peers) {
+          manager?.addPeer(peer);
+          void manager?.connectToPeer(peer.peerId);
         }
         return;
       }
 
       if (message.type === "peer-joined") {
-        manager?.addPeer(message.peerId);
-        recordEvent("peer-joined", "info", message.peerId);
+        manager?.addPeer(message.peer);
+        store.setMember({
+          userId: message.peer.userId,
+          displayName: message.peer.displayName,
+          role: message.peer.role,
+          fingerprint: message.peer.fingerprint,
+          publicKey: "",
+        });
+        recordEvent("peer-joined", "info", message.peer.peerId);
         return;
       }
 
@@ -154,6 +173,31 @@ export function usePeerSession(): {
         manager?.removePeer(message.peerId);
         store.removePeer(message.peerId);
         recordEvent("peer-left", "info", message.peerId);
+        return;
+      }
+
+      if (message.type === "member-added") {
+        store.setMember(message.member);
+        recordEvent("member-added");
+        return;
+      }
+      if (message.type === "member-removed") {
+        store.removeMember(message.userId);
+        recordEvent("member-removed");
+        return;
+      }
+      if (message.type === "role-changed") {
+        store.setMemberRole(message.userId, message.role);
+        manager?.updateUserRole(message.userId, message.role);
+        recordEvent(`role-changed:${message.role}`);
+        return;
+      }
+      if (message.type === "kicked") {
+        activeSessionRef.current = null;
+        teardownManager();
+        store.resetSession();
+        store.setError(message.message);
+        recordEvent("kicked-from-workspace", "error");
         return;
       }
 
@@ -174,8 +218,12 @@ export function usePeerSession(): {
   const handleOpen = useCallback((): void => {
     const active = activeSessionRef.current;
     if (!active) return;
-    const sent = sendRef.current({ type: "join", ...active });
-    if (sent) recordEvent("room-rejoin-sent");
+    const sent = sendRef.current({
+      type: "join",
+      workspaceId: active.workspaceId,
+      peerId: active.peerId,
+    });
+    if (sent) recordEvent("workspace-rejoin-sent");
   }, []);
 
   const handleDisconnect = useCallback((): void => {
@@ -191,117 +239,113 @@ export function usePeerSession(): {
     recordEvent("invalid-server-message", "error");
   }, []);
 
-  const signal = useSignalSocket({
-    onMessage: handleServerMessage,
-    onOpen: handleOpen,
-    onDisconnect: handleDisconnect,
-    onInvalidMessage: handleInvalidMessage,
-  });
+  const signal = useSignalSocket(
+    {
+      onMessage: handleServerMessage,
+      onOpen: handleOpen,
+      onDisconnect: handleDisconnect,
+      onInvalidMessage: handleInvalidMessage,
+    },
+    accessToken,
+  );
   sendRef.current = signal.send;
 
-  const joinRoom = useCallback(
-    (rawRoomId: string): void => {
-      const parsedRoom = roomIdSchema.safeParse(rawRoomId.trim());
-      if (!parsedRoom.success) {
-        usePeerStore
-          .getState()
-          .setError("Room ID must be 1-64 letters, numbers, _ or -");
-        return;
-      }
-      if (!peerId) {
-        usePeerStore.getState().setError("Peer ID is still being created");
-        return;
-      }
-      if (!identityRef.current) {
-        usePeerStore
-          .getState()
-          .setError("Browser identity is still being prepared");
-        return;
-      }
-      if (activeSessionRef.current) {
-        usePeerStore
-          .getState()
-          .setError("Leave the current room before joining another");
-        return;
-      }
+  const joinWorkspace = useCallback((): void => {
+    if (!peerId) {
+      usePeerStore.getState().setError("Peer ID is still being created");
+      return;
+    }
+    if (!identityRef.current) {
+      usePeerStore
+        .getState()
+        .setError("Browser identity is still being prepared");
+      return;
+    }
+    if (activeSessionRef.current) {
+      usePeerStore
+        .getState()
+        .setError("Leave the current room before joining another");
+      return;
+    }
 
-      const active = { roomId: parsedRoom.data, peerId };
-      const store = usePeerStore.getState();
-      store.resetSession();
-      store.setActiveRoom(active.roomId);
-      store.setError(null);
-      activeSessionRef.current = active;
+    const active = { workspaceId, peerId };
+    const store = usePeerStore.getState();
+    store.resetSession();
+    store.setActiveWorkspace(active.workspaceId);
+    store.setError(null);
+    activeSessionRef.current = active;
 
-      const manager = new PeerManager(
+    const manager = new PeerManager(
+      peerId,
+      (to, data) => {
+        if (!sendRef.current({ type: "signal", to, data })) {
+          recordEvent("signal-send-failed", "error", to);
+        }
+      },
+      identityRef.current,
+      verifiedFingerprintsRef.current,
+    );
+    managerRef.current = manager;
+    managerUnsubscribeRef.current = [
+      manager.events.on("state", (state) => {
+        usePeerStore.getState().setPeer(state);
+      }),
+      manager.events.on("removed", ({ peerId: removedPeerId }) => {
+        usePeerStore.getState().removePeer(removedPeerId);
+      }),
+      manager.events.on("message", ({ peerId: fromPeerId, message }) => {
+        usePeerStore.getState().addMessage({
+          id: crypto.randomUUID(),
+          peerId: fromPeerId,
+          message,
+          direction: "received",
+        });
+      }),
+      manager.events.on("log", (event) => {
+        usePeerStore.getState().addEvent(event);
+      }),
+      manager.events.on("transfer", (transfer) => {
+        usePeerStore.getState().setTransfer(transfer);
+        if (transfer.direction === "incoming" && transfer.state !== "waiting") {
+          usePeerStore
+            .getState()
+            .removeIncomingOffer(transfer.peerId, transfer.transferId);
+        }
+        usePeerStore.getState().addEvent({
+          at: Date.now(),
+          level: transfer.state === "failed" ? "error" : "info",
+          event: `transfer-${transfer.state}`,
+          peerId: transfer.peerId,
+        });
+      }),
+      manager.events.on("incomingOffer", (offer) => {
+        usePeerStore.getState().addIncomingOffer(offer);
+        usePeerStore.getState().addEvent({
+          at: Date.now(),
+          level: "info",
+          event: "file-offer-received",
+          peerId: offer.peerId,
+        });
+      }),
+    ];
+
+    if (
+      !sendRef.current({
+        type: "join",
+        workspaceId: active.workspaceId,
         peerId,
-        (to, data) => {
-          if (!sendRef.current({ type: "signal", to, data })) {
-            recordEvent("signal-send-failed", "error", to);
-          }
-        },
-        identityRef.current,
-        verifiedFingerprintsRef.current,
-      );
-      managerRef.current = manager;
-      managerUnsubscribeRef.current = [
-        manager.events.on("state", (state) => {
-          usePeerStore.getState().setPeer(state);
-        }),
-        manager.events.on("removed", ({ peerId: removedPeerId }) => {
-          usePeerStore.getState().removePeer(removedPeerId);
-        }),
-        manager.events.on("message", ({ peerId: fromPeerId, message }) => {
-          usePeerStore.getState().addMessage({
-            id: crypto.randomUUID(),
-            peerId: fromPeerId,
-            message,
-            direction: "received",
-          });
-        }),
-        manager.events.on("log", (event) => {
-          usePeerStore.getState().addEvent(event);
-        }),
-        manager.events.on("transfer", (transfer) => {
-          usePeerStore.getState().setTransfer(transfer);
-          if (
-            transfer.direction === "incoming" &&
-            transfer.state !== "waiting"
-          ) {
-            usePeerStore
-              .getState()
-              .removeIncomingOffer(transfer.peerId, transfer.transferId);
-          }
-          usePeerStore.getState().addEvent({
-            at: Date.now(),
-            level: transfer.state === "failed" ? "error" : "info",
-            event: `transfer-${transfer.state}`,
-            peerId: transfer.peerId,
-          });
-        }),
-        manager.events.on("incomingOffer", (offer) => {
-          usePeerStore.getState().addIncomingOffer(offer);
-          usePeerStore.getState().addEvent({
-            at: Date.now(),
-            level: "info",
-            event: "file-offer-received",
-            peerId: offer.peerId,
-          });
-        }),
-      ];
+      })
+    ) {
+      recordEvent("workspace-join-queued-until-connected");
+    } else {
+      recordEvent(`workspace-join-sent:${active.workspaceId}`);
+    }
+  }, [peerId, workspaceId]);
 
-      if (!sendRef.current({ type: "join", ...active })) {
-        recordEvent("room-join-queued-until-connected");
-      } else {
-        recordEvent(`room-join-sent:${active.roomId}`);
-      }
-    },
-    [peerId],
-  );
-
-  const leaveRoom = useCallback((): void => {
+  const leaveWorkspace = useCallback((): void => {
     if (activeSessionRef.current) {
       sendRef.current({ type: "leave" });
-      recordEvent("room-leave-sent");
+      recordEvent("workspace-leave-sent");
     }
     activeSessionRef.current = null;
     teardownManager();
@@ -331,7 +375,13 @@ export function usePeerSession(): {
     (file: File, targetPeerId: string | "all"): number => {
       const manager = managerRef.current;
       if (!usePeerStore.getState().isJoined || !manager) {
-        usePeerStore.getState().setError("Join a room before sending files");
+        usePeerStore
+          .getState()
+          .setError("Join the workspace before sending files");
+        return 0;
+      }
+      if (localRole === "viewer") {
+        usePeerStore.getState().setError("Viewers cannot send files");
         return 0;
       }
       if (file.size > MAX_FILE_SIZE) {
@@ -361,7 +411,7 @@ export function usePeerSession(): {
       usePeerStore.getState().setError(null);
       return results[0]?.transferId ?? 0;
     },
-    [],
+    [localRole],
   );
 
   const acceptTransfer = useCallback(
@@ -460,11 +510,11 @@ export function usePeerSession(): {
     peerId,
     identity,
     identityError,
-    activeRoomId,
+    activeWorkspaceId,
     isJoined,
     openPeerCount,
-    joinRoom,
-    leaveRoom,
+    joinWorkspace,
+    leaveWorkspace,
     sendChat,
     sendFile,
     acceptTransfer,

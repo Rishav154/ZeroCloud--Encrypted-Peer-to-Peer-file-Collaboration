@@ -18,7 +18,10 @@ type SignalSocketHandlers = {
   onInvalidMessage: (error: string) => void;
 };
 
-export function useSignalSocket(handlers: SignalSocketHandlers): {
+export function useSignalSocket(
+  handlers: SignalSocketHandlers,
+  accessToken: string | null,
+): {
   send: (message: ClientSignalMessage) => boolean;
 } {
   const socketRef = useRef<WebSocket | null>(null);
@@ -30,6 +33,10 @@ export function useSignalSocket(handlers: SignalSocketHandlers): {
 
   useEffect(() => {
     let stopped = false;
+    if (!accessToken) {
+      setStatus("disconnected");
+      return;
+    }
 
     const scheduleReconnect = (): void => {
       if (stopped || retryTimerRef.current) return;
@@ -57,8 +64,7 @@ export function useSignalSocket(handlers: SignalSocketHandlers): {
 
       socket.addEventListener("open", () => {
         attemptRef.current = 0;
-        setStatus("connected");
-        handlersRef.current.onOpen();
+        socket.send(JSON.stringify({ type: "auth", token: accessToken }));
       });
       socket.addEventListener("message", (event: MessageEvent<unknown>) => {
         if (typeof event.data !== "string") {
@@ -70,6 +76,11 @@ export function useSignalSocket(handlers: SignalSocketHandlers): {
         const parsed = parseServerMessage(event.data);
         if (!parsed.success) {
           handlersRef.current.onInvalidMessage(parsed.error);
+          return;
+        }
+        if (parsed.data.type === "authenticated") {
+          setStatus("connected");
+          handlersRef.current.onOpen();
           return;
         }
         handlersRef.current.onMessage(parsed.data);
@@ -89,7 +100,7 @@ export function useSignalSocket(handlers: SignalSocketHandlers): {
       socketRef.current?.close();
       socketRef.current = null;
     };
-  }, [setStatus]);
+  }, [accessToken, setStatus]);
 
   const send = useCallback((message: ClientSignalMessage): boolean => {
     const socket = socketRef.current;

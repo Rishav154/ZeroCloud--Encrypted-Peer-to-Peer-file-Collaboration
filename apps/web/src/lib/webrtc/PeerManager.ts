@@ -15,7 +15,9 @@ import {
   type ChatMessage,
   type HelloMessage,
   type IdentityAlgorithm,
+  type PeerDirectoryEntry,
   type SignalData,
+  type WorkspaceRole,
 } from "@zerocloud/shared";
 import { TypedEventEmitter } from "./TypedEventEmitter";
 import { FileSender } from "../transfer/FileSender";
@@ -30,10 +32,13 @@ import {
 
 export type CandidateType = "host" | "srflx" | "relay";
 export type HandshakeState =
-  "handshaking" | "secure" | "incompatible" | "failed";
+  "handshaking" | "secure" | "incompatible" | "identity-mismatch" | "failed";
 
 export type PeerSnapshot = {
   peerId: string;
+  userId: string | null;
+  displayName: string | null;
+  role: WorkspaceRole | null;
   connectionState: RTCPeerConnectionState;
   iceConnectionState: RTCIceConnectionState;
   dataChannelState: RTCDataChannelState | "unavailable";
@@ -88,6 +93,7 @@ type PeerRecord = {
   cryptoContext: PeerCryptoContext | null;
   protocolQueue: Promise<void>;
   handshakeError: string | null;
+  directory: PeerDirectoryEntry | null;
 };
 
 type SignalSender = (to: string, data: SignalData) => void;
@@ -154,8 +160,18 @@ export class PeerManager {
     return Array.from(this.peers.keys());
   }
 
-  addPeer(peerId: string): void {
-    this.getOrCreatePeer(peerId);
+  addPeer(entry: PeerDirectoryEntry): void {
+    const peer = this.getOrCreatePeer(entry.peerId);
+    peer.directory = entry;
+    this.updateState(entry.peerId, peer);
+  }
+
+  updateUserRole(userId: string, role: "editor" | "viewer"): void {
+    for (const [peerId, peer] of this.peers) {
+      if (peer.directory?.userId !== userId) continue;
+      peer.directory = { ...peer.directory, role };
+      this.updateState(peerId, peer);
+    }
   }
 
   async connectToPeer(peerId: string): Promise<void> {
@@ -248,7 +264,11 @@ export class PeerManager {
     let sent = 0;
 
     for (const [peerId, peer] of this.peers) {
-      if (peer.channel?.readyState !== "open") continue;
+      if (
+        peer.channel?.readyState !== "open" ||
+        peer.handshakeState !== "secure"
+      )
+        continue;
       try {
         peer.channel.send(serialized);
         sent += 1;
@@ -368,6 +388,7 @@ export class PeerManager {
       cryptoContext: null,
       protocolQueue: Promise.resolve(),
       handshakeError: null,
+      directory: null,
     };
     this.peers.set(peerId, peer);
 
@@ -555,7 +576,12 @@ export class PeerManager {
   ): FileReceiver {
     const current = this.receivers.get(peerId);
     if (current) return current;
-    const receiver = new FileReceiver(peerId, channel, context);
+    const receiver = new FileReceiver(
+      peerId,
+      channel,
+      context,
+      () => this.peers.get(peerId)?.directory?.role ?? null,
+    );
     receiver.events.on("transfer", (transfer) =>
       this.events.emit("transfer", transfer),
     );
@@ -612,6 +638,7 @@ export class PeerManager {
     } catch {
       return;
     }
+    if (peer.handshakeState === "identity-mismatch") return;
     if (isRecord(decoded) && decoded.type === "hello") {
       if (peer.helloReceived)
         return this.failHandshake(
@@ -645,6 +672,7 @@ export class PeerManager {
     const parsed = dataChannelMessageSchema.safeParse(decoded);
     if (!parsed.success) return;
     if (parsed.data.type === "chat") {
+      if (peer.handshakeState !== "secure") return;
       this.events.emit("message", { peerId, message: parsed.data });
       this.log("info", "chat-received", peerId);
       return;
@@ -707,6 +735,14 @@ export class PeerManager {
       peer.remoteNonce = remoteNonce;
       peer.remotePublicKey = remotePublicKey;
       peer.remoteFingerprint = await fingerprintPublicKey(remotePublicKey);
+      if (peer.directory?.fingerprint !== peer.remoteFingerprint) {
+        peer.handshakeState = "identity-mismatch";
+        peer.failed = true;
+        peer.handshakeError = "Identity mismatch with workspace directory";
+        this.log("error", "identity-mismatch", peerId);
+        this.updateState(peerId, peer);
+        return;
+      }
       peer.sameIdentity = peer.remoteFingerprint === this.identity.fingerprint;
       const sessionKey = await deriveSessionKey({
         algorithm: hello.alg,
@@ -935,6 +971,9 @@ export class PeerManager {
     if (peer.disposed) return;
     this.events.emit("state", {
       peerId,
+      userId: peer.directory?.userId ?? null,
+      displayName: peer.directory?.displayName ?? null,
+      role: peer.directory?.role ?? null,
       connectionState: peer.connection.connectionState,
       iceConnectionState: peer.connection.iceConnectionState,
       dataChannelState: peer.channel?.readyState ?? "unavailable",

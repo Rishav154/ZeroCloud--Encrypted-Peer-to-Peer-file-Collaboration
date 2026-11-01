@@ -7,7 +7,8 @@
     "build": "pnpm --filter @zerocloud/shared build && pnpm --filter @zerocloud/signal build && pnpm --filter @zerocloud/web build",
     "lint": "eslint .",
     "typecheck": "pnpm --filter @zerocloud/shared typecheck && pnpm --filter @zerocloud/signal typecheck && pnpm --filter @zerocloud/web typecheck",
-    "test": "pnpm --filter @zerocloud/shared test && pnpm --filter @zerocloud/shared build && pnpm --filter @zerocloud/web test",
+    "db:migrate": "pnpm --filter @zerocloud/signal db:migrate",
+    "test": "pnpm --filter @zerocloud/shared test && pnpm --filter @zerocloud/shared build && pnpm --filter @zerocloud/signal test && pnpm --filter @zerocloud/web test",
     "format": "prettier --write ."
   },
   "devDependencies": {

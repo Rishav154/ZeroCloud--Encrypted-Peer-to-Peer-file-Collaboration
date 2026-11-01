@@ -11,6 +11,7 @@ import {
   type FileControlMessage,
   type FileOfferMessage,
   type FileOfferPayload,
+  type WorkspaceRole,
   unpackChunk,
 } from "@zerocloud/shared";
 import { TypedEventEmitter } from "../webrtc/TypedEventEmitter";
@@ -46,6 +47,7 @@ export class FileReceiver {
     private readonly peerId: string,
     private readonly channel: RTCDataChannel,
     private readonly cryptoContext: PeerCryptoContext,
+    private readonly getSenderRole: () => WorkspaceRole | null = () => null,
   ) {}
 
   async handleString(raw: string): Promise<boolean> {
@@ -239,6 +241,10 @@ export class FileReceiver {
   private async handleOffer(wireOffer: FileOfferMessage): Promise<void> {
     if (this.disposed) return;
     const transferId = wireOffer.transferId;
+    if (this.getSenderRole() !== "editor" && this.getSenderRole() !== "owner") {
+      this.rejectMetadata(transferId, "no write permission");
+      return;
+    }
     try {
       const sealed = base64ToBytes(wireOffer.sealed);
       const plaintext = await open(
