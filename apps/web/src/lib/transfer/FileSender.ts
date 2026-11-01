@@ -14,7 +14,7 @@ import {
 } from "@zerocloud/shared";
 import { TypedEventEmitter } from "../webrtc/TypedEventEmitter";
 import { localToRemoteAad, type PeerCryptoContext } from "./cryptoContext";
-import type { TransferSnapshot } from "./types";
+import type { SyncTransferOptions, TransferSnapshot } from "./types";
 
 type SenderEvents = {
   transfer: TransferSnapshot;
@@ -31,6 +31,7 @@ type Job = {
   cancelled: boolean;
   pending: Pending | null;
   wakeBuffer: (() => void) | null;
+  options?: SyncTransferOptions;
 };
 
 export class FileSender {
@@ -45,7 +46,7 @@ export class FileSender {
     private readonly cryptoContext: PeerCryptoContext,
   ) {}
 
-  enqueue(file: File, transferId: number): void {
+  enqueue(file: File, transferId: number, options?: SyncTransferOptions): void {
     const job: Job = {
       file,
       transferId,
@@ -60,10 +61,14 @@ export class FileSender {
         progress: 0,
         speed: 0,
         eta: null,
+        ...(options
+          ? { purpose: options.purpose, requestId: options.requestId }
+          : {}),
       },
       cancelled: false,
       pending: null,
       wakeBuffer: null,
+      ...(options ? { options } : {}),
     };
     this.emit(job);
     if (this.disposed)
@@ -168,6 +173,9 @@ export class FileSender {
       totalChunks,
       sha256,
       fileKey: bytesToBase64(rawFileKey),
+      ...(job.options
+        ? { purpose: job.options.purpose, requestId: job.options.requestId }
+        : {}),
     };
     rawFileKey.fill(0);
     const sealed = await seal(

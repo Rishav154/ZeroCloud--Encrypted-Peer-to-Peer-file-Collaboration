@@ -15,6 +15,7 @@ import {
   unpackChunk,
 } from "@zerocloud/shared";
 import { TypedEventEmitter } from "../webrtc/TypedEventEmitter";
+import { classifyPullOffer } from "../sync/pullMatching";
 import { remoteToLocalAad, type PeerCryptoContext } from "./cryptoContext";
 import type { IncomingOffer, TransferSnapshot } from "./types";
 
@@ -37,9 +38,17 @@ type Incoming = {
   sampleBytes: number;
 };
 
+export type SyncPullExpectation = {
+  requestId: string;
+  fileId: string;
+  sha256: string;
+  size: number;
+};
+
 export class FileReceiver {
   readonly events = new TypedEventEmitter<ReceiverEvents>();
   private readonly incoming = new Map<number, Incoming>();
+  private readonly syncPulls = new Map<string, SyncPullExpectation>();
   private disposed = false;
   private chunkQueue: Promise<void> = Promise.resolve();
 
@@ -49,6 +58,14 @@ export class FileReceiver {
     private readonly cryptoContext: PeerCryptoContext,
     private readonly getSenderRole: () => WorkspaceRole | null = () => null,
   ) {}
+
+  expectSyncPull(expectation: SyncPullExpectation): void {
+    this.syncPulls.set(expectation.requestId, expectation);
+  }
+
+  cancelSyncPull(requestId: string): void {
+    this.syncPulls.delete(requestId);
+  }
 
   async handleString(raw: string): Promise<boolean> {
     let decoded: unknown;
@@ -167,6 +184,7 @@ export class FileReceiver {
       this.emit(item);
     }
     this.incoming.clear();
+    this.syncPulls.clear();
     this.events.clear();
   }
 
@@ -241,10 +259,6 @@ export class FileReceiver {
   private async handleOffer(wireOffer: FileOfferMessage): Promise<void> {
     if (this.disposed) return;
     const transferId = wireOffer.transferId;
-    if (this.getSenderRole() !== "editor" && this.getSenderRole() !== "owner") {
-      this.rejectMetadata(transferId, "no write permission");
-      return;
-    }
     try {
       const sealed = base64ToBytes(wireOffer.sealed);
       const plaintext = await open(
@@ -259,6 +273,19 @@ export class FileReceiver {
       const parsed = fileOfferPayloadSchema.safeParse(parsedJson);
       if (!parsed.success) throw new Error("Invalid encrypted file metadata");
       const metadata = parsed.data;
+      const senderRole = this.getSenderRole();
+      if (senderRole === null) {
+        this.rejectMetadata(transferId, "unknown workspace role", metadata);
+        return;
+      }
+      if (
+        metadata.purpose !== "sync" &&
+        senderRole !== "editor" &&
+        senderRole !== "owner"
+      ) {
+        this.rejectMetadata(transferId, "no write permission", metadata);
+        return;
+      }
       const rawKey = base64ToBytes(metadata.fileKey);
       if (rawKey.byteLength !== 32)
         throw new Error("Invalid encrypted file key");
@@ -275,6 +302,19 @@ export class FileReceiver {
       }
       if (this.incoming.has(transferId))
         return this.rejectMetadata(transferId, "Transfer ID is already active");
+      const expected = metadata.requestId
+        ? this.syncPulls.get(metadata.requestId)
+        : undefined;
+      const pullMatch = classifyPullOffer(metadata, expected);
+      if (pullMatch === "reject") {
+        this.syncPulls.delete(metadata.requestId!);
+        this.rejectMetadata(
+          transferId,
+          "Sync offer does not match the requested file",
+          metadata,
+        );
+        return;
+      }
       const fileKey = await crypto.subtle.importKey(
         "raw",
         rawKey.slice().buffer as ArrayBuffer,
@@ -295,10 +335,12 @@ export class FileReceiver {
         direction: "incoming",
         name: metadata.name,
         size: metadata.size,
-        state: "waiting",
+        state: pullMatch === "auto-accept" ? "receiving" : "waiting",
         progress: 0,
         speed: 0,
         eta: null,
+        ...(metadata.purpose ? { purpose: metadata.purpose } : {}),
+        ...(metadata.requestId ? { requestId: metadata.requestId } : {}),
       };
       const item: Incoming = {
         transferId,
@@ -322,18 +364,33 @@ export class FileReceiver {
         totalChunks: metadata.totalChunks,
         sha256: metadata.sha256,
       };
-      this.events.emit("offer", {
-        peerId: this.peerId,
-        transferId,
-        metadata: displayMetadata,
-      });
+      if (expected && pullMatch === "auto-accept") {
+        this.syncPulls.delete(expected.requestId);
+        item.accepted = true;
+        this.send({ type: "file-accept", transferId });
+        this.log(`sync-pull-accepted:${expected.fileId}`);
+      } else {
+        this.events.emit("offer", {
+          peerId: this.peerId,
+          transferId,
+          metadata: {
+            ...displayMetadata,
+            ...(metadata.purpose ? { purpose: metadata.purpose } : {}),
+            ...(metadata.requestId ? { requestId: metadata.requestId } : {}),
+          },
+        });
+      }
       this.emit(item);
     } catch {
       this.failEncryptedOffer(transferId);
     }
   }
 
-  private rejectMetadata(transferId: number, reason: string): void {
+  private rejectMetadata(
+    transferId: number,
+    reason: string,
+    metadata?: Pick<FileOfferPayload, "purpose" | "requestId">,
+  ): void {
     this.send({ type: "file-reject", transferId, reason });
     this.events.emit("transfer", {
       key: `${this.peerId}:${transferId}`,
@@ -346,6 +403,8 @@ export class FileReceiver {
       progress: 0,
       speed: 0,
       eta: null,
+      ...(metadata?.purpose ? { purpose: metadata.purpose } : {}),
+      ...(metadata?.requestId ? { requestId: metadata.requestId } : {}),
       error: reason,
     });
   }

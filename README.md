@@ -102,6 +102,60 @@ Open a workspace in two authenticated browser profiles, create an invite from th
 
 `NEXT_PUBLIC_FORCE_P256=true` forces a P-256 identity. `NEXT_PUBLIC_DEBUG_WIRE=true` adds ciphertext prefixes and byte counts to the debug panel. `NEXT_PUBLIC_DEBUG_TAMPER=true` flips a bit in the third file chunk during development to exercise integrity failure.
 
+## Workspace file library and peer sync (Phase 6)
+
+Checkpoint A adds the **Files** workspace tab and stores each browser's local file library in IndexedDB. Entries are keyed by `[workspaceId, fileId]`; blobs are stored separately with their SHA-256 digest, and a per-workspace metadata record keeps the Lamport high-water mark. Uploads hash the file with browser WebCrypto before saving. Blob and entry writes share one transaction, so an aborted or quota-failed replacement leaves the previous committed file intact. Storage usage is estimated with the browser Storage API, with a warning at 80%.
+
+Files are plaintext in local IndexedDB during this phase. This is a documented limitation; Phase 6 does not add encryption at rest. The library stores a separate local copy in each browser profile.
+
+Writers (owners and editors) may upload, replace, keep both same-named files, and delete. Viewers can only download locally present files. Delete keeps a tombstone and removes the local blob. Tombstones count toward the 500-entry workspace limit and are not garbage-collected in this phase. File identity is the UUID `fileId`; a replace creates a newer entry for that ID, while Keep both creates another ID. If multiple live entries share a name, the UI adds their author display name for clarity.
+
+Entry order is last-writer-wins by `(lamport, author)` in ascending lexicographic order; the greater tuple wins. Lamport values are workspace-local and a new local change uses one greater than the highest value seen. `modifiedAt` is display metadata and does not determine the winner. Concurrent changes to the same file ID can therefore silently overwrite the losing entry.
+
+Each member keeps its own IndexedDB copy. On a secure, directory-authorized DataChannel, peers exchange manifests, compare entry versions, and request missing blobs directly from a peer that advertised the exact version. Deltas announce writer changes. The server is unchanged and receives no names, sizes, hashes, manifest entries, or file bytes.
+
+Sync message payloads (inside the encrypted envelope):
+
+| Message        | Payload                                                                 | Purpose                                                 |
+| -------------- | ----------------------------------------------------------------------- | ------------------------------------------------------- |
+| `manifest`     | `syncId`, fragment index/count, up to 12,000 plaintext bytes of entries | Exchange the full entry set on a secure peer connection |
+| `delta`        | Up to 20 entries                                                        | Broadcast local writer changes to secure peers          |
+| `pull-request` | `requestId`, `fileId`, expected SHA-256                                 | Request a particular local blob from a peer             |
+| `pull-denied`  | `requestId`, `not-found`, `hash-mismatch`, or `forbidden`               | Explain why the requested blob cannot be sent           |
+
+The DataChannel wire form is `{ type: "sync", header, sealed }`. The strict, cleartext header contains exactly `{ v: 1, messageType, workspaceId, syncId, partIndex, totalParts, seq }`. It contains no file names, hashes, sizes, file IDs, or entries. Header fields are validated before decryption; messages for another workspace are silently dropped. The receiver builds AES-GCM AAD from the received header and the sender/receiver fingerprints bound by the Phase 4 key-confirmed peer connection, in this order: `zerocloud/v1/sync || messageType || workspaceId || syncId || partIndex || totalParts || seq || senderFingerprint || receiverFingerprint`. Changing any authenticated value causes decryption to fail.
+
+`seq` is a per-sender, per-connection counter beginning at 1. A message group increments it once; all fragments of one manifest share that sequence. Receivers reject any sequence at or below the highest accepted sequence, except distinct fragment indexes in that same manifest group. A new peer connection has a fresh Phase 4 session key and reset counters. Manifest assembly is keyed by peer connection and sync ID, bounded to 1 MB and 64 fragments, expires incomplete assemblies after 30 seconds, and discards an assembly if a part fails authentication. Wire messages including the header are capped at 16 KiB. The encrypted channel also uses WebRTC DTLS.
+
+```mermaid
+sequenceDiagram
+    participant A as Peer A
+    participant B as Peer B
+    A->>B: sealed manifest fragments
+    B->>A: sealed manifest fragments
+    B->>B: compare (lamport, author), validate writer
+    B->>A: sealed pull-request(fileId, sha256)
+    A->>B: normal sealed file offer (purpose=sync, requestId)
+    B->>A: file-accept
+    A->>B: encrypted chunks and file-complete
+    B->>B: verify SHA-256, commit blob and entry
+    A-->>B: sealed delta after later local changes
+```
+
+The peer that advertised an entry is a candidate source. A requester will only auto-accept a `purpose: "sync"` transfer when its request ID, peer, expected size, and hash match an outstanding pull. Pulls queue at a maximum of two per peer and four total, retry up to three times with exponential backoff, and try another peer advertising the same hash when possible. The transfer itself remains the existing encrypted Phase 3/4 file-transfer path. Quick send remains a separate ad-hoc transfer. In development, `NEXT_PUBLIC_DEBUG_FORGE_VIEWER=true` adds a viewer-only control for sending a deliberately forged delta; authorized peers reject its viewer authorship.
+
+Known Phase 6 limitations:
+
+- Last-writer-wins may silently discard a concurrent edit; there is no conflict UI or file history.
+- Entry authorship is not signed. A malicious workspace writer could forge another writer's fingerprint in metadata.
+- Local IndexedDB blobs are plaintext at rest.
+- Sync runs only while browser tabs are open; there is no background sync.
+- Removed members retain files and keys they already copied; key rotation is out of scope.
+- The cleartext sync header (message type, workspace ID, fragment count/index and sequence) is visible only to the peer browser; sync messages do not pass through the signalling server. DataChannels are additionally protected by DTLS.
+- The signalling server learns which members are online in each workspace, but never receives filenames, file sizes, hashes, manifests, or file contents.
+
+To verify sync locally, open the same workspace in two authenticated browser profiles, join from both, wait until each peer shows `in sync`, then upload a file in **Files**. The other profile should show the file progressing from queued/pulling to synced; download it there and compare its digest with `sha256sum`. Close one profile, make a change in the other, then reopen and rejoin the first profile to verify manifest catch-up. The development-only random operations control runs for at most 60 seconds and the state hash appears in the peer debug panel.
+
 ## Tests and known limitations
 
 Run `pnpm test`, `pnpm typecheck`, and `pnpm lint`. API tests use `TEST_DATABASE_URL` and truncate tables between tests; never point it at a development or production database. Workspace crypto tests use Node WebCrypto and cover X25519/P-256 wrapping, self-wrap, wrong recipients, AAD tampering, sealed names, and invite-key sealing with correct and incorrect secrets.

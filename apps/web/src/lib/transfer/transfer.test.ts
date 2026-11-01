@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { IdentityTransform, chunkCount } from "@zerocloud/shared";
+import {
+  IdentityTransform,
+  bytesToBase64,
+  chunkCount,
+  seal,
+} from "@zerocloud/shared";
 import { FileReceiver } from "./FileReceiver";
-import type { PeerCryptoContext } from "./cryptoContext";
+import { remoteToLocalAad, type PeerCryptoContext } from "./cryptoContext";
 
 describe("web transfer primitives", () => {
   it("uses the shared 16 KiB chunk size boundaries", () => {
@@ -28,10 +33,21 @@ describe("web transfer primitives", () => {
         readyState: "open",
         send: (message: string) => sent.push(message),
       } as unknown as RTCDataChannel;
+      const context: PeerCryptoContext = {
+        sessionKey: await crypto.subtle.generateKey(
+          { name: "AES-GCM", length: 256 },
+          false,
+          ["encrypt", "decrypt"],
+        ),
+        localFingerprint: "1".repeat(64),
+        remoteFingerprint: "2".repeat(64),
+        localNonce: new Uint8Array(32).fill(1),
+        remoteNonce: new Uint8Array(32).fill(2),
+      };
       const receiver = new FileReceiver(
         "remote-peer",
         channel,
-        {} as PeerCryptoContext,
+        context,
         () => role,
       );
       const transferStates: string[] = [];
@@ -39,18 +55,40 @@ describe("web transfer primitives", () => {
         transferStates.push(`${transfer.state}:${transfer.error}`),
       );
 
+      const offer = {
+        fileKey: bytesToBase64(new Uint8Array(32).fill(3)),
+        name: "test.txt",
+        mime: "text/plain",
+        size: 0,
+        sha256:
+          "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        chunkSize: 16 * 1024,
+        totalChunks: 0,
+        lastModified: 1,
+      };
+      const sealed = await seal(
+        context.sessionKey,
+        new TextEncoder().encode(JSON.stringify(offer)),
+        remoteToLocalAad(context, "file-offer", 12),
+      );
       await receiver.handleString(
-        JSON.stringify({ type: "file-offer", transferId: 12, sealed: "AA==" }),
+        JSON.stringify({
+          type: "file-offer",
+          transferId: 12,
+          sealed: bytesToBase64(sealed),
+        }),
       );
 
+      const rejectionReason =
+        role === null ? "unknown workspace role" : "no write permission";
       expect(sent).toEqual([
         JSON.stringify({
           type: "file-reject",
           transferId: 12,
-          reason: "no write permission",
+          reason: rejectionReason,
         }),
       ]);
-      expect(transferStates).toEqual(["rejected:no write permission"]);
+      expect(transferStates).toEqual([`rejected:${rejectionReason}`]);
     },
   );
 });

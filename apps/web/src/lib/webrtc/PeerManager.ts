@@ -12,17 +12,32 @@ import {
   readyPayloadSchema,
   seal,
   utf8,
+  buildSyncAad,
+  parseSyncWire,
+  syncPayloadSchema,
+  SyncReplayGuard,
+  MAX_SYNC_PLAINTEXT_BYTES,
+  MAX_SYNC_WIRE_BYTES,
   type ChatMessage,
   type HelloMessage,
   type IdentityAlgorithm,
   type PeerDirectoryEntry,
   type SignalData,
   type WorkspaceRole,
+  type SyncHeader,
+  type SyncPayload,
 } from "@zerocloud/shared";
 import { TypedEventEmitter } from "./TypedEventEmitter";
 import { FileSender } from "../transfer/FileSender";
-import { FileReceiver } from "../transfer/FileReceiver";
-import type { IncomingOffer, TransferSnapshot } from "../transfer/types";
+import {
+  FileReceiver,
+  type SyncPullExpectation,
+} from "../transfer/FileReceiver";
+import type {
+  IncomingOffer,
+  SyncTransferOptions,
+  TransferSnapshot,
+} from "../transfer/types";
 import type { StoredIdentity } from "../identity/identityStore";
 import {
   localToRemoteAad,
@@ -58,6 +73,8 @@ export type PeerManagerEvents = {
   message: { peerId: string; message: ChatMessage };
   transfer: TransferSnapshot;
   incomingOffer: IncomingOffer;
+  syncMessage: { peerId: string; header: SyncHeader; message: SyncPayload };
+  syncRejected: { peerId: string; syncId?: string; reason: string };
   log: {
     at: number;
     level: "info" | "error";
@@ -94,6 +111,9 @@ type PeerRecord = {
   protocolQueue: Promise<void>;
   handshakeError: string | null;
   directory: PeerDirectoryEntry | null;
+  syncSendSeq: number;
+  syncReceiveGuard: SyncReplayGuard;
+  syncSendQueue: Promise<void>;
 };
 
 type SignalSender = (to: string, data: SignalData) => void;
@@ -101,6 +121,7 @@ type IceSignal = Extract<SignalData, { kind: "ice" }>;
 
 const STUN_FALLBACK = "stun:stun.l.google.com:19302";
 const CHAT_TYPE = "chat";
+const SYNC_TYPE = "sync";
 
 function asRtcIceCandidate(
   candidate: IceSignal["candidate"],
@@ -151,6 +172,7 @@ export class PeerManager {
 
   constructor(
     private readonly localPeerId: string,
+    private readonly workspaceId: string,
     private readonly sendSignal: SignalSender,
     private readonly identity: StoredIdentity,
     private readonly verifiedFingerprints: Set<string>,
@@ -281,7 +303,11 @@ export class PeerManager {
     return { message, sent };
   }
 
-  sendFile(peerId: string, file: File): number | null {
+  sendFile(
+    peerId: string,
+    file: File,
+    options?: SyncTransferOptions,
+  ): number | null {
     const peer = this.peers.get(peerId);
     if (
       peer?.channel?.readyState !== "open" ||
@@ -293,9 +319,147 @@ export class PeerManager {
     this.getSender(peerId, peer.channel, peer.cryptoContext).enqueue(
       file,
       transferId,
+      options,
     );
     this.log("info", "file-queued", peerId);
     return transferId;
+  }
+
+  async sendSyncPayloads(
+    peerId: string,
+    messages: SyncPayload[],
+  ): Promise<boolean> {
+    const peer = this.peers.get(peerId);
+    if (
+      !peer?.channel ||
+      peer.channel.readyState !== "open" ||
+      peer.handshakeState !== "secure" ||
+      !peer.cryptoContext ||
+      !peer.directory?.role ||
+      messages.length === 0
+    ) {
+      return false;
+    }
+    const task = peer.syncSendQueue.then(async () => {
+      if (peer.disposed || peer.channel?.readyState !== "open") return false;
+      const hasManifest = messages.some(
+        (message) => message.type === "manifest",
+      );
+      const allManifest = messages.every(
+        (message) => message.type === "manifest",
+      );
+      if (hasManifest !== allManifest) {
+        throw new Error("A sync send cannot mix manifest and other messages");
+      }
+      if (allManifest) {
+        const fragments = messages.filter(
+          (message): message is Extract<SyncPayload, { type: "manifest" }> =>
+            message.type === "manifest",
+        );
+        const first = fragments[0];
+        const indexes = new Set(
+          fragments.map((fragment) => fragment.partIndex),
+        );
+        if (
+          !first ||
+          fragments.length !== first.totalParts ||
+          fragments.some(
+            (fragment) =>
+              fragment.syncId !== first.syncId ||
+              fragment.totalParts !== first.totalParts,
+          ) ||
+          indexes.size !== fragments.length ||
+          Array.from({ length: first.totalParts }, (_, index) => index).some(
+            (index) => !indexes.has(index),
+          )
+        ) {
+          throw new Error("Manifest fragments must form one complete manifest");
+        }
+      }
+      const groups = allManifest
+        ? [messages]
+        : messages.map((message) => [message]);
+      const context = peer.cryptoContext;
+      if (!context) return false;
+      for (const group of groups) {
+        const seq = peer.syncSendSeq + 1;
+        if (seq > 0xffffffff)
+          throw new Error("Sync message sequence exhausted");
+        peer.syncSendSeq = seq;
+        for (const message of group) {
+          const parsed = syncPayloadSchema.safeParse(message);
+          if (!parsed.success) throw new Error("Invalid sync payload");
+          const partIndex = message.type === "manifest" ? message.partIndex : 0;
+          const totalParts =
+            message.type === "manifest" ? message.totalParts : 1;
+          const header: SyncHeader = {
+            v: 1,
+            messageType: message.type,
+            workspaceId: this.workspaceId,
+            syncId: message.syncId,
+            partIndex,
+            totalParts,
+            seq,
+          };
+          const plaintext = utf8(JSON.stringify(message));
+          if (plaintext.byteLength > MAX_SYNC_PLAINTEXT_BYTES) {
+            throw new Error("Sync plaintext exceeds 12,000 bytes");
+          }
+          const sealed = await seal(
+            context.sessionKey,
+            plaintext,
+            buildSyncAad(
+              header,
+              context.localFingerprint,
+              context.remoteFingerprint,
+            ),
+          );
+          const wire = JSON.stringify({
+            type: SYNC_TYPE,
+            header,
+            sealed: bytesToBase64(sealed),
+          });
+          if (utf8(wire).byteLength > MAX_SYNC_WIRE_BYTES) {
+            throw new Error("Encrypted sync message exceeds 16 KiB");
+          }
+          if (peer.disposed || peer.channel?.readyState !== "open")
+            return false;
+          peer.channel.send(wire);
+        }
+      }
+      return true;
+    });
+    peer.syncSendQueue = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    try {
+      return await task;
+    } catch (error) {
+      this.log("error", `sync-send-failed:${readableError(error)}`, peerId);
+      return false;
+    }
+  }
+
+  expectSyncPull(peerId: string, expectation: SyncPullExpectation): boolean {
+    const peer = this.peers.get(peerId);
+    if (
+      !peer?.channel ||
+      peer.channel.readyState !== "open" ||
+      peer.handshakeState !== "secure" ||
+      !peer.cryptoContext ||
+      !peer.directory?.role
+    ) {
+      return false;
+    }
+    this.getReceiver(peerId, peer.channel, peer.cryptoContext).expectSyncPull(
+      expectation,
+    );
+    return true;
+  }
+
+  cancelSyncPull(peerId: string, requestId: string): void {
+    this.receivers.get(peerId)?.cancelSyncPull(requestId);
   }
 
   sendFileToAll(file: File): { peerId: string; transferId: number }[] {
@@ -389,6 +553,9 @@ export class PeerManager {
       protocolQueue: Promise.resolve(),
       handshakeError: null,
       directory: null,
+      syncSendSeq: 0,
+      syncReceiveGuard: new SyncReplayGuard(),
+      syncSendQueue: Promise.resolve(),
     };
     this.peers.set(peerId, peer);
 
@@ -498,6 +665,9 @@ export class PeerManager {
     peer.cryptoContext = null;
     peer.handshakeError = null;
     peer.protocolQueue = Promise.resolve();
+    peer.syncSendSeq = 0;
+    peer.syncReceiveGuard = new SyncReplayGuard();
+    peer.syncSendQueue = Promise.resolve();
 
     const onOpen = (): void => {
       this.log("info", "datachannel-open", peerId);
@@ -638,6 +808,10 @@ export class PeerManager {
     } catch {
       return;
     }
+    if (isRecord(decoded) && decoded.type === SYNC_TYPE) {
+      await this.handleSyncWire(peerId, peer, raw);
+      return;
+    }
     if (peer.handshakeState === "identity-mismatch") return;
     if (isRecord(decoded) && decoded.type === "hello") {
       if (peer.helloReceived)
@@ -703,6 +877,79 @@ export class PeerManager {
         peer.cryptoContext,
       );
       await receiver.handleString(raw);
+    }
+  }
+
+  private async handleSyncWire(
+    peerId: string,
+    peer: PeerRecord,
+    raw: string,
+  ): Promise<void> {
+    const parsed = parseSyncWire(raw, this.workspaceId);
+    if (!parsed.ok) {
+      if (parsed.reason === "workspace") return;
+      const reason =
+        parsed.reason === "oversize"
+          ? "Sync wire message exceeds 16 KiB"
+          : "Invalid sync envelope header";
+      this.events.emit("syncRejected", { peerId, reason });
+      this.log("error", "sync-envelope-invalid", peerId);
+      return;
+    }
+    const { header, sealed } = parsed.message;
+    if (
+      peer.handshakeState !== "secure" ||
+      !peer.cryptoContext ||
+      !peer.directory?.role
+    ) {
+      this.events.emit("syncRejected", {
+        peerId,
+        syncId: header.syncId,
+        reason: "Sync requires a secure peer with a known role",
+      });
+      return;
+    }
+    if (!peer.syncReceiveGuard.canAccept(header)) {
+      this.log("info", "sync-replay-rejected", peerId);
+      return;
+    }
+    try {
+      const context = peer.cryptoContext;
+      const plaintext = await open(
+        context.sessionKey,
+        base64ToBytes(sealed),
+        buildSyncAad(
+          header,
+          context.remoteFingerprint,
+          context.localFingerprint,
+        ),
+      );
+      if (plaintext.byteLength > MAX_SYNC_PLAINTEXT_BYTES) {
+        throw new Error("Sync plaintext exceeds 12,000 bytes");
+      }
+      const decoded: unknown = JSON.parse(new TextDecoder().decode(plaintext));
+      const message = syncPayloadSchema.parse(decoded);
+      if (
+        message.type !== header.messageType ||
+        message.syncId !== header.syncId ||
+        (message.type === "manifest" &&
+          (message.partIndex !== header.partIndex ||
+            message.totalParts !== header.totalParts)) ||
+        (message.type !== "manifest" &&
+          (header.partIndex !== 0 || header.totalParts !== 1))
+      ) {
+        throw new Error("Sync payload does not match its authenticated header");
+      }
+      peer.syncReceiveGuard.accept(header);
+      this.events.emit("syncMessage", { peerId, header, message });
+    } catch (error) {
+      peer.syncReceiveGuard.discardManifest(header.syncId);
+      this.events.emit("syncRejected", {
+        peerId,
+        syncId: header.syncId,
+        reason: readableError(error),
+      });
+      this.log("error", "sync-authentication-failed", peerId);
     }
   }
 

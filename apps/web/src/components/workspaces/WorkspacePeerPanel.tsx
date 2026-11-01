@@ -5,6 +5,7 @@ import { MAX_FILE_SIZE, formatFingerprint } from "@zerocloud/shared";
 import { usePeerSession } from "../../hooks/use-peer-session";
 import { usePeerStore } from "../../lib/peer-store";
 import { useSignalStore } from "../../lib/signal-store";
+import { useSyncStore } from "../../lib/sync/sync-store";
 import { Button } from "../ui/button";
 import {
   Card,
@@ -73,6 +74,8 @@ export default function WorkspacePeerPanel({
     verifyPeer,
   } = usePeerSession(workspaceId, role);
   const signalStatus = useSignalStore((state) => state.status);
+  const syncPeerStatuses = useSyncStore((state) => state.peers);
+  const syncStateHash = useSyncStore((state) => state.stateHash);
   const peersById = usePeerStore((state) => state.peers);
   const peers = Object.values(peersById);
   const messages = usePeerStore((state) => state.messages);
@@ -365,6 +368,13 @@ export default function WorkspacePeerPanel({
                                   className={`rounded-full px-2 py-0.5 ${peer.verified ? "bg-emerald-950 text-emerald-200" : "bg-yellow-950 text-yellow-200"}`}
                                 >
                                   {peer.verified ? "Verified" : "Unverified"}
+                                </span>
+                              )}
+                              {peer.handshakeState === "secure" && (
+                                <span
+                                  className={`rounded-full px-2 py-0.5 ${syncPeerStatuses[peer.peerId] === "in-sync" ? "bg-emerald-950 text-emerald-200" : syncPeerStatuses[peer.peerId] === "error" ? "bg-rose-950 text-rose-200" : "bg-amber-950 text-amber-200"}`}
+                                >
+                                  {syncPeerStatuses[peer.peerId] ?? "syncing"}
                                 </span>
                               )}
                               {peer.handshakeState === "secure" &&
@@ -679,6 +689,9 @@ export default function WorkspacePeerPanel({
             <span className="ml-2 text-xs text-zinc-500">{events.length}</span>
           </summary>
           <div className="max-h-56 space-y-1 overflow-y-auto border-t border-zinc-800 px-5 py-3 font-mono text-xs">
+            <div className="mb-2 border-b border-zinc-800 pb-2 text-zinc-500">
+              Local sync state hash: {syncStateHash ?? "pending"}
+            </div>
             {events.length === 0 ? (
               <p className="text-zinc-600">No events yet.</p>
             ) : (

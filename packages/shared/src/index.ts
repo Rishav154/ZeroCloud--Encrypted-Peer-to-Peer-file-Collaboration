@@ -1,5 +1,7 @@
 import { z } from "zod";
+import { syncWireMessageSchema } from "./sync/protocol.js";
 export * from "./crypto/index.js";
+export * from "./sync/index.js";
 
 export const pingSchema = z.object({
   type: z.literal("ping"),
@@ -166,15 +168,34 @@ export const fileOfferSchema = z.object({
   transferId: z.number().int().nonnegative().max(0xffffffff),
   sealed: z.string().min(1),
 });
-export const fileOfferPayloadSchema = z.object({
-  name: z.string().min(1).max(1024),
-  size: z.number().int().nonnegative(),
-  mime: z.string().max(255),
-  chunkSize: z.number().int().positive(),
-  totalChunks: z.number().int().nonnegative(),
-  sha256: z.string().regex(/^[a-f0-9]{64}$/i),
-  fileKey: z.string().min(1),
-});
+export const fileOfferPayloadSchema = z
+  .object({
+    name: z.string().min(1).max(1024),
+    size: z.number().int().nonnegative(),
+    mime: z.string().max(255),
+    chunkSize: z.number().int().positive(),
+    totalChunks: z.number().int().nonnegative(),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/i),
+    fileKey: z.string().min(1),
+    purpose: z.enum(["sync", "adhoc"]).optional(),
+    requestId: z.string().uuid().optional(),
+  })
+  .superRefine((payload, context) => {
+    if (payload.purpose === "sync" && !payload.requestId) {
+      context.addIssue({
+        code: "custom",
+        message: "A sync transfer must include its pull request ID",
+        path: ["requestId"],
+      });
+    }
+    if (payload.purpose !== "sync" && payload.requestId) {
+      context.addIssue({
+        code: "custom",
+        message: "A pull request ID is only valid for sync transfers",
+        path: ["requestId"],
+      });
+    }
+  });
 export const fileAcceptSchema = z.object({
   type: z.literal("file-accept"),
   transferId: z.number().int().nonnegative().max(0xffffffff),
@@ -228,6 +249,7 @@ export const dataChannelMessageSchema = z.union([
   helloMessageSchema,
   readyMessageSchema,
   fileControlMessageSchema,
+  syncWireMessageSchema,
 ]);
 
 export type FileOfferMessage = z.infer<typeof fileOfferSchema>;

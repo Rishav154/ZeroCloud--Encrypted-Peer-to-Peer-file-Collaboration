@@ -5,6 +5,8 @@ import {
   MAX_FILE_SIZE,
   type ClientSignalMessage,
   type ServerSignalMessage,
+  type SyncPayload,
+  type WorkspaceMemberDirectory,
 } from "@zerocloud/shared";
 import { usePeerStore } from "../lib/peer-store";
 import { PeerManager } from "../lib/webrtc/PeerManager";
@@ -17,6 +19,8 @@ import {
 } from "../lib/identity/identityStore";
 import { useSignalSocket } from "./use-signal-socket";
 import { useAuthStore } from "../lib/auth/session";
+import { WorkspaceSyncManager } from "../lib/sync/WorkspaceSyncManager";
+import type { SyncTransferOptions } from "../lib/transfer/types";
 
 type ActiveSession = { workspaceId: string; peerId: string };
 type IdentityView = {
@@ -71,6 +75,7 @@ export function usePeerSession(
       ).length,
   );
   const managerRef = useRef<PeerManager | null>(null);
+  const syncManagerRef = useRef<WorkspaceSyncManager | null>(null);
   const activeSessionRef = useRef<ActiveSession | null>(null);
   const sendRef = useRef<(message: ClientSignalMessage) => boolean>(
     () => false,
@@ -83,6 +88,15 @@ export function usePeerSession(
   const [identityError, setIdentityError] = useState<string | null>(null);
   const setPeerId = usePeerStore((state) => state.setPeerId);
   const accessToken = useAuthStore((state) => state.accessToken);
+  const user = useAuthStore((state) => state.user);
+  const localRoleRef = useRef(localRole);
+  localRoleRef.current = localRole;
+  const membersByUserId = usePeerStore((state) => state.members);
+  const memberDirectoryRef = useRef<WorkspaceMemberDirectory[]>([]);
+  useEffect(() => {
+    const current = Object.values(membersByUserId);
+    if (current.length > 0) memberDirectoryRef.current = current;
+  }, [membersByUserId]);
 
   useEffect(() => {
     if (!peerId) setPeerId(crypto.randomUUID());
@@ -126,6 +140,8 @@ export function usePeerSession(
     for (const unsubscribe of managerUnsubscribeRef.current.splice(0)) {
       unsubscribe();
     }
+    syncManagerRef.current?.destroy();
+    syncManagerRef.current = null;
     managerRef.current?.destroy();
     managerRef.current = null;
   }, []);
@@ -182,7 +198,14 @@ export function usePeerSession(
         return;
       }
       if (message.type === "member-removed") {
+        const departedPeers = Object.values(store.peers)
+          .filter((peer) => peer.userId === message.userId)
+          .map((peer) => peer.peerId);
         store.removeMember(message.userId);
+        for (const departedPeerId of departedPeers) {
+          manager?.removePeer(departedPeerId);
+          store.removePeer(departedPeerId);
+        }
         recordEvent("member-removed");
         return;
       }
@@ -270,13 +293,19 @@ export function usePeerSession(
 
     const active = { workspaceId, peerId };
     const store = usePeerStore.getState();
+    const knownMembers = Object.values(store.members);
+    if (knownMembers.length > 0) memberDirectoryRef.current = knownMembers;
     store.resetSession();
+    if (memberDirectoryRef.current.length > 0) {
+      store.setMembers(memberDirectoryRef.current);
+    }
     store.setActiveWorkspace(active.workspaceId);
     store.setError(null);
     activeSessionRef.current = active;
 
     const manager = new PeerManager(
       peerId,
+      workspaceId,
       (to, data) => {
         if (!sendRef.current({ type: "signal", to, data })) {
           recordEvent("signal-send-failed", "error", to);
@@ -286,11 +315,51 @@ export function usePeerSession(
       verifiedFingerprintsRef.current,
     );
     managerRef.current = manager;
+    const syncManager = new WorkspaceSyncManager(
+      workspaceId,
+      identityRef.current.fingerprint,
+      () => {
+        const selfRole = user?.id
+          ? usePeerStore.getState().members[user.id]?.role
+          : undefined;
+        return selfRole ?? localRoleRef.current;
+      },
+      () =>
+        Object.values(usePeerStore.getState().members).map((member) => ({
+          fingerprint: member.fingerprint,
+          role: member.role,
+        })),
+      {
+        isSecure: (remotePeerId) => {
+          const snapshot = usePeerStore.getState().peers[remotePeerId];
+          return (
+            snapshot?.handshakeState === "secure" &&
+            snapshot.dataChannelState === "open" &&
+            snapshot.role !== null
+          );
+        },
+        getRole: (remotePeerId) =>
+          usePeerStore.getState().peers[remotePeerId]?.role ?? null,
+        send: (remotePeerId, messages: SyncPayload[]) =>
+          manager.sendSyncPayloads(remotePeerId, messages),
+        expectPull: (remotePeerId, expectation) =>
+          manager.expectSyncPull(remotePeerId, expectation),
+        cancelPull: (remotePeerId, requestId) =>
+          manager.cancelSyncPull(remotePeerId, requestId),
+        sendFile: (remotePeerId, file, options: SyncTransferOptions) =>
+          manager.sendFile(remotePeerId, file, options),
+      },
+      (event, remotePeerId, error = false) =>
+        recordEvent(event, error ? "error" : "info", remotePeerId),
+    );
+    syncManagerRef.current = syncManager;
     managerUnsubscribeRef.current = [
       manager.events.on("state", (state) => {
         usePeerStore.getState().setPeer(state);
+        syncManager.peerState(state.peerId, state.handshakeState, state.role);
       }),
       manager.events.on("removed", ({ peerId: removedPeerId }) => {
+        syncManager.peerRemoved(removedPeerId);
         usePeerStore.getState().removePeer(removedPeerId);
       }),
       manager.events.on("message", ({ peerId: fromPeerId, message }) => {
@@ -305,6 +374,7 @@ export function usePeerSession(
         usePeerStore.getState().addEvent(event);
       }),
       manager.events.on("transfer", (transfer) => {
+        syncManager.transfer(transfer);
         usePeerStore.getState().setTransfer(transfer);
         if (transfer.direction === "incoming" && transfer.state !== "waiting") {
           usePeerStore
@@ -327,6 +397,23 @@ export function usePeerSession(
           peerId: offer.peerId,
         });
       }),
+      manager.events.on("syncMessage", ({ peerId: fromPeerId, message }) => {
+        void syncManager
+          .receive(fromPeerId, message)
+          .catch((error: unknown) => {
+            recordEvent(
+              `sync-message-processing-failed:${error instanceof Error ? error.message : "unknown error"}`,
+              "error",
+              fromPeerId,
+            );
+          });
+      }),
+      manager.events.on(
+        "syncRejected",
+        ({ peerId: fromPeerId, syncId, reason }) => {
+          syncManager.rejected(fromPeerId, syncId, reason);
+        },
+      ),
     ];
 
     if (
@@ -340,7 +427,7 @@ export function usePeerSession(
     } else {
       recordEvent(`workspace-join-sent:${active.workspaceId}`);
     }
-  }, [peerId, workspaceId]);
+  }, [peerId, user, workspaceId]);
 
   const leaveWorkspace = useCallback((): void => {
     if (activeSessionRef.current) {

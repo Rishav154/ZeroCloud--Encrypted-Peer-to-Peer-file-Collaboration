@@ -23,9 +23,16 @@ export type TransferSnapshot = {
   eta: number | null;
   error?: string;
   blob?: Blob;
+  purpose?: "sync" | "adhoc";
+  requestId?: string;
 };
 export type IncomingOffer = {
   peerId: string;
   transferId: number;
   metadata: Omit<FileOfferPayload, "fileKey">;
+};
+
+export type SyncTransferOptions = {
+  purpose: "sync";
+  requestId: string;
 };
