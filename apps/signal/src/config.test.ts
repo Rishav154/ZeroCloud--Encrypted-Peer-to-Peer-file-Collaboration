@@ -10,9 +10,6 @@ const validProduction = {
   ALLOWED_ORIGIN: "https://app.example.test",
   WEB_ORIGIN: "https://app.example.test",
   JWT_SECRET: "production-test-secret-that-is-long-enough-123",
-  ICE_MODE: "provider",
-  TURN_APP_NAME: "zerocloud-test",
-  TURN_PROVIDER_SECRET: "provider-test-secret",
 };
 
 describe("production environment validation", () => {

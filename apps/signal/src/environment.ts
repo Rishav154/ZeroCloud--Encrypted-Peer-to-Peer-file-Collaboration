@@ -14,14 +14,6 @@ export const environmentSchema = z.object({
   ALLOWED_ORIGIN: url,
   WEB_ORIGIN: url,
   JWT_SECRET: z.string().min(32),
-  STUN_URLS: z.string().default("stun:stun.l.google.com:19302"),
-  ICE_MODE: z.enum(["provider", "static"]).default("static"),
-  TURN_APP_NAME: z.string().optional(),
-  TURN_PROVIDER_SECRET: z.string().optional(),
-  TURN_CREDENTIAL_TTL_SECONDS: z.coerce.number().int().min(300).max(86_400).default(3600),
-  ICE_STATIC_URLS: z.string().optional(),
-  ICE_STATIC_USERNAME: z.string().optional(),
-  ICE_STATIC_CREDENTIAL: z.string().optional(),
   BUILD_SHA: z.string().default("local"),
   BUILD_TIME: z.string().default("unknown"),
   TEST_DATABASE_URL: url.optional(),
@@ -48,14 +40,6 @@ export const environmentSchema = z.object({
         context.addIssue({ code: "custom", path: [key], message: "HTTP is allowed only for localhost outside production" });
       }
     }
-  }
-  if (value.ICE_MODE === "provider") {
-    if (!value.TURN_APP_NAME) context.addIssue({ code: "custom", path: ["TURN_APP_NAME"], message: "is required in provider mode" });
-    if (!value.TURN_PROVIDER_SECRET) context.addIssue({ code: "custom", path: ["TURN_PROVIDER_SECRET"], message: "is required in provider mode" });
-  } else if (value.NODE_ENV === "production" || value.ICE_STATIC_URLS || value.ICE_STATIC_USERNAME || value.ICE_STATIC_CREDENTIAL) {
-    if (!value.ICE_STATIC_URLS) context.addIssue({ code: "custom", path: ["ICE_STATIC_URLS"], message: "is required in static mode" });
-    if (!value.ICE_STATIC_USERNAME) context.addIssue({ code: "custom", path: ["ICE_STATIC_USERNAME"], message: "is required in static mode" });
-    if (!value.ICE_STATIC_CREDENTIAL) context.addIssue({ code: "custom", path: ["ICE_STATIC_CREDENTIAL"], message: "is required in static mode" });
   }
 });
 

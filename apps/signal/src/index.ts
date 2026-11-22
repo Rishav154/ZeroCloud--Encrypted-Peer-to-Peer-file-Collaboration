@@ -10,7 +10,6 @@ import { createDatabasePool } from "./db/pool.js";
 import { migrateDatabase } from "./db/migrate.js";
 import { DatabaseHealth, waitForPool } from "./db/readiness.js";
 import { createHealthHandler } from "./health.js";
-import { IceServerService } from "./iceServers.js";
 import { httpLogger, logger } from "./logging.js";
 import { WorkspaceHub } from "./workspaceHub.js";
 import { buildInfo } from "./build-info.generated.js";
@@ -40,7 +39,6 @@ async function start(): Promise<void> {
 
   const pool = createDatabasePool(config.DATABASE_URL, config);
   const databaseHealth = new DatabaseHealth(() => pool.query("SELECT 1"));
-  const iceServerService = new IceServerService(config);
   const connectionLimits = new ConnectionLimits(20, 10);
   const workspaceHub = new WorkspaceHub(pool, config.JWT_SECRET, connectionLimits);
   const app = express();
@@ -54,7 +52,7 @@ async function start(): Promise<void> {
   app.use(cors({ origin: config.ALLOWED_ORIGIN }));
   app.use(helmet());
   app.use(express.json({ limit: "64kb" }));
-  app.use("/api", createApiRouter(pool, config, workspaceHub, iceServerService));
+  app.use("/api", createApiRouter(pool, config, workspaceHub));
   app.get("/health", createHealthHandler(databaseHealth, {
     BUILD_SHA: buildInfo.sha,
     BUILD_TIME: buildInfo.time,

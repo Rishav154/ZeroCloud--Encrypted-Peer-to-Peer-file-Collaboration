@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 dotenv.config({ path: "../../.env" });
 
 const nextConfig: NextConfig = {
+  allowedDevOrigins: ["10.11.51.194"],
   transpilePackages: ["@zerocloud/shared"],
   experimental: { useTypeScriptCli: false },
   env: {

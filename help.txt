@@ -1,0 +1,21 @@
+To start the dev server for fresh installation:
+
+cp .env.example .env
+docker compose up -d
+pnpm install
+pnpm dev
+
+
+Otherwise:
+
+docker compose up -d
+pnpm install
+pnpm db:migrate
+pnpm dev
+
+
+To start the project database from a terminal:
+
+cd "/home/rishav/Code/WebDev/Zero Cloud"
+docker compose up -d
+pnpm db:migrate

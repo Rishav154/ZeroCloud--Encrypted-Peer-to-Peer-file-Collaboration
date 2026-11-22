@@ -23,11 +23,3 @@ services:
         sync: false
       - key: JWT_SECRET
         sync: false
-      - key: ICE_MODE
-        value: provider
-      - key: TURN_APP_NAME
-        sync: false
-      - key: TURN_PROVIDER_SECRET
-        sync: false
-      - key: STUN_URLS
-        value: stun:stun.l.google.com:19302

@@ -108,7 +108,7 @@ Chat remains protected by WebRTC DTLS and the authenticated transport session on
 
 ## Workspace peer and file-transfer testing
 
-Open a workspace in two authenticated browser profiles, create an invite from the owner profile, and open the link in the second profile. The invite secret appears only after `#`, and the page strips it from the address bar after reading it. Join the workspace from each tab and test chat and direct file transfer. The invitation is single use and expires on its selected schedule; pending invites may be revoked. The browser fetches authenticated, short-lived ICE credentials from `/api/ice-servers`; provider and static credentials live only in the signal server environment. `STUN_URLS` configures the server's STUN list. `NEXT_PUBLIC_ICE_URLS` lists only public STUN/TURN URL hosts so the web CSP can allow browser ICE traffic. Do not set any `NEXT_PUBLIC_TURN_*` values.
+Open a workspace in two authenticated browser profiles, create an invite from the owner profile, and open the link in the second profile. The invite secret appears only after `#`, and the page strips it from the address bar after reading it. Join the workspace from each tab and test chat and direct file transfer. The invitation is single use and expires on its selected schedule; pending invites may be revoked. `NEXT_PUBLIC_STUN_URLS` configures comma-separated public STUN URLs; optional `NEXT_PUBLIC_TURN_URL`, `NEXT_PUBLIC_TURN_USERNAME`, and `NEXT_PUBLIC_TURN_CREDENTIAL` values configure TURN directly in the browser. Any TURN credentials placed in `NEXT_PUBLIC_*` settings are shipped to clients, so use credentials intended for browser use.
 
 `NEXT_PUBLIC_FORCE_P256=true` forces a P-256 identity. `NEXT_PUBLIC_DEBUG_WIRE=true` adds ciphertext prefixes and byte counts to the debug panel. `NEXT_PUBLIC_DEBUG_TAMPER=true` flips a bit in the third file chunk during development to exercise integrity failure.
 
@@ -218,10 +218,10 @@ flowchart LR
   B -->|HTTPS API and WSS signaling| R[Render signal service]
   B <-->|WebRTC DataChannel: DTLS| B
   R -->|pooled queries and direct migrations| N[(Neon PostgreSQL metadata)]
-  R -->|server-side credential API| M[Metered TURN]
+  B -->|STUN/TURN requests| M[Configured ICE servers]
 ```
 
-The nonce-based Content Security Policy is produced by the Next.js proxy from the configured API origin, HTTPS/WSS signaling origin, and `NEXT_PUBLIC_ICE_URLS` ICE hosts. Pages are dynamically rendered to provide a fresh nonce; this is acceptable for this app. Development permits `unsafe-eval` for the Next dev runtime. Production does not permit inline scripts without the per-request nonce.
+The nonce-based Content Security Policy is produced by the Next.js proxy from the configured API origin, HTTPS/WSS signaling origin, and configured STUN/TURN hosts. Pages are dynamically rendered to provide a fresh nonce; this is acceptable for this app. Development permits `unsafe-eval` for the Next dev runtime. Production does not permit inline scripts without the per-request nonce.
 
 `pnpm db:backup` creates a timestamped custom-format dump under `backups/`. `pnpm db:restore -- <file>` asks for the exact word `RESTORE` before replacing objects in the configured direct database. Use a scratch database for restore drills. `pnpm check:client-secrets` builds the web bundle and scans it for server-side env values where available; CI runs this after build.
 

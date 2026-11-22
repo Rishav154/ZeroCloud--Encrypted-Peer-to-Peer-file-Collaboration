@@ -7,7 +7,7 @@ export function proxy(request: NextRequest) {
   const csp = buildContentSecurityPolicy(nonce, {
     apiUrl: process.env.NEXT_PUBLIC_API_URL,
     signalUrl: process.env.NEXT_PUBLIC_SIGNAL_URL,
-    iceUrls: process.env.NEXT_PUBLIC_ICE_URLS,
+    iceUrls: [process.env.NEXT_PUBLIC_STUN_URLS ?? "stun:stun.l.google.com:19302", process.env.NEXT_PUBLIC_TURN_URL ?? ""].filter(Boolean).join(","),
     production: process.env.NODE_ENV === "production",
   });
   const requestHeaders = new Headers(request.headers);

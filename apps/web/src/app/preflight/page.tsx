@@ -6,7 +6,6 @@ import { Button } from "../../components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../../components/ui/card";
 import { loadExistingIdentity } from "../../lib/identity/identityStore";
 import { useAuthStore } from "../../lib/auth/session";
-import { iceServerCache } from "../../lib/network/iceServers";
 import { publicConfig } from "../../lib/config";
 
 type CheckStatus = "checking" | "green" | "red" | "amber";
@@ -31,7 +30,6 @@ const initialResults = (): Record<CheckId, CheckResult> => Object.fromEntries(
 ) as Record<CheckId, CheckResult>;
 
 export default function PreflightPage() {
-  const accessToken = useAuthStore((state) => state.accessToken);
   const hydrate = useAuthStore((state) => state.hydrate);
   const [results, setResults] = useState<Record<CheckId, CheckResult>>(initialResults);
   const [running, setRunning] = useState<Set<CheckId>>(new Set());
@@ -48,7 +46,7 @@ export default function PreflightPage() {
     setResult(id, "checking", "Checking…");
     let wakeTimer: ReturnType<typeof setTimeout> | null = null;
     try {
-      const task = runCheckTask(id, accessToken);
+      const task = runCheckTask(id);
       const slow = new Promise<void>((resolve) => {
         wakeTimer = setTimeout(() => {
           setResult(id, "amber", "Waking up the server… retrying automatically");
@@ -70,7 +68,7 @@ export default function PreflightPage() {
         return next;
       });
     }
-  }, [accessToken, setResult]);
+  }, [setResult]);
 
   const runAll = useCallback((): void => {
     for (const id of Object.keys(titles) as CheckId[]) void runCheck(id);
@@ -138,7 +136,7 @@ export default function PreflightPage() {
   );
 }
 
-async function runCheckTask(id: CheckId, accessToken: string | null): Promise<{ status: CheckStatus; detail: string }> {
+async function runCheckTask(id: CheckId): Promise<{ status: CheckStatus; detail: string }> {
   if (id === "secure") {
     const secure = window.isSecureContext && Boolean(globalThis.crypto?.subtle);
     return secure
@@ -153,7 +151,7 @@ async function runCheckTask(id: CheckId, accessToken: string | null): Promise<{ 
   if (id === "indexeddb") return testIndexedDb();
   if (id === "health") return testHealth();
   if (id === "websocket") return testWebSocket();
-  if (id === "ice") return testIce(accessToken);
+  if (id === "ice") return testIce();
   if (id === "identity") {
     const identity = await loadExistingIdentity();
     if (!identity) return { status: "amber", detail: "No identity yet" };
@@ -287,11 +285,19 @@ function pingWebSocket(): Promise<number> {
   });
 }
 
-async function testIce(accessToken: string | null): Promise<{ status: CheckStatus; detail: string }> {
-  if (!accessToken) return { status: "amber", detail: "Sign in to test server-issued TURN credentials" };
-  const bundle = await iceServerCache.get(accessToken);
+async function testIce(): Promise<{ status: CheckStatus; detail: string }> {
+  const iceServers: RTCIceServer[] = publicConfig.NEXT_PUBLIC_STUN_URLS
+    .split(",").map((urls) => urls.trim()).filter(Boolean).map((urls) => ({ urls }));
+  const turnUrls = publicConfig.NEXT_PUBLIC_TURN_URL.split(",").map((url) => url.trim()).filter(Boolean);
+  if (turnUrls.length > 0) {
+    iceServers.push({
+      urls: turnUrls,
+      ...(publicConfig.NEXT_PUBLIC_TURN_USERNAME ? { username: publicConfig.NEXT_PUBLIC_TURN_USERNAME } : {}),
+      ...(publicConfig.NEXT_PUBLIC_TURN_CREDENTIAL ? { credential: publicConfig.NEXT_PUBLIC_TURN_CREDENTIAL } : {}),
+    });
+  }
   const connection = new RTCPeerConnection({
-    iceServers: bundle.iceServers,
+    iceServers,
     ...(publicConfig.NEXT_PUBLIC_FORCE_RELAY === "true" ? { iceTransportPolicy: "relay" as const } : {}),
   });
   const candidates = new Set<RTCIceCandidateType>();
