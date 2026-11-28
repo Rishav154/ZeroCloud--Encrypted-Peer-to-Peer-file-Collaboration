@@ -10,6 +10,7 @@ const validProduction = {
   ALLOWED_ORIGIN: "https://app.example.test",
   WEB_ORIGIN: "https://app.example.test",
   JWT_SECRET: "production-test-secret-that-is-long-enough-123",
+  NEARBY_SECRET: "nearby-production-test-secret-is-long-enough-123",
 };
 
 describe("production environment validation", () => {

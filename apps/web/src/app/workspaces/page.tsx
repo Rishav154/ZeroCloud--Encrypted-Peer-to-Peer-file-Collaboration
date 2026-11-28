@@ -76,6 +76,7 @@ function WorkspaceList() {
             </p>
           </div>
           <div className="flex items-center gap-3">
+            <Link href="/nearby" className="text-sm text-violet-300 hover:text-white">Nearby</Link>
             <Link href="/" className="text-sm text-zinc-400 hover:text-white">
               My workspaces
             </Link>

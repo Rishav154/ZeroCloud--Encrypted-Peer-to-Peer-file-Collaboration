@@ -13,6 +13,7 @@ import { createHealthHandler } from "./health.js";
 import { httpLogger, logger } from "./logging.js";
 import { WorkspaceHub } from "./workspaceHub.js";
 import { buildInfo } from "./build-info.generated.js";
+import { deriveClientIp } from "./nearby.js";
 
 async function start(): Promise<void> {
   const startupPool = createDatabasePool(config.DIRECT_DATABASE_URL, {
@@ -40,7 +41,7 @@ async function start(): Promise<void> {
   const pool = createDatabasePool(config.DATABASE_URL, config);
   const databaseHealth = new DatabaseHealth(() => pool.query("SELECT 1"));
   const connectionLimits = new ConnectionLimits(20, 10);
-  const workspaceHub = new WorkspaceHub(pool, config.JWT_SECRET, connectionLimits);
+  const workspaceHub = new WorkspaceHub(pool, config.JWT_SECRET, connectionLimits, config.NEARBY_SECRET);
   const app = express();
   const server = createServer(app);
   const sockets = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
@@ -82,10 +83,7 @@ async function start(): Promise<void> {
       socket.destroy();
       return;
     }
-    const forwardedFor = request.headers["x-forwarded-for"];
-    const ip = typeof forwardedFor === "string"
-      ? forwardedFor.split(",")[0]?.trim() || request.socket.remoteAddress || "unknown"
-      : request.socket.remoteAddress || "unknown";
+    const ip = deriveClientIp(request.headers["x-forwarded-for"], request.socket.remoteAddress, config.TRUST_PROXY_HOPS);
     sockets.handleUpgrade(request, socket, head, (webSocket) => {
       ipBySocket.set(webSocket, ip);
       sockets.emit("connection", webSocket, request);
@@ -101,7 +99,7 @@ async function start(): Promise<void> {
     alive.set(socket, true);
     socket.on("pong", () => alive.set(socket, true));
     socket.on("close", () => connectionLimits.releaseIp(ip));
-    workspaceHub.accept(socket);
+    workspaceHub.accept(socket, ip);
   });
 
   const heartbeat = setInterval(() => {

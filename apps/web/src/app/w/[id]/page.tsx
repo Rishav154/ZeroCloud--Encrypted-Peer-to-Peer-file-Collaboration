@@ -297,6 +297,7 @@ function WorkspaceDetail() {
               <p className="mt-2 text-sm text-zinc-500">
                 Key version {workspace.currentKeyVersion}
               </p>
+              <a href="/nearby" className="mt-2 inline-block text-sm text-violet-300">Nearby devices</a>
               {workspace.needsRotation && (
                 <p role="status" className="mt-3 rounded-lg border border-amber-800 bg-amber-950/40 p-3 text-sm text-amber-200">
                   A member left. Rotate the workspace key to protect new content from their old key.

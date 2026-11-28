@@ -14,6 +14,8 @@ export const environmentSchema = z.object({
   ALLOWED_ORIGIN: url,
   WEB_ORIGIN: url,
   JWT_SECRET: z.string().min(32),
+  NEARBY_SECRET: z.string().min(32),
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(10).default(1),
   BUILD_SHA: z.string().default("local"),
   BUILD_TIME: z.string().default("unknown"),
   TEST_DATABASE_URL: url.optional(),

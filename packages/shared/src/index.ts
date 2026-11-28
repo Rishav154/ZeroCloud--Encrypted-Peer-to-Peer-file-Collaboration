@@ -57,6 +57,31 @@ export const iceSignalSchema = z.object({
 
 export const signalDataSchema = z.union([offerSignalSchema, iceSignalSchema]);
 
+export const nearbyAliasSchema = z.string().min(1).max(24).regex(/^[A-Za-z0-9 _-]+$/);
+export const nearbyPeerSchema = z.object({ peerId: peerIdSchema, alias: nearbyAliasSchema, fingerprint: z.string().regex(/^[a-f0-9]{64}$/), keyAlg: z.enum(["X25519", "P-256"]) }).strict();
+export const connectRequestSchema = z.object({ kind: z.literal("connect-request") }).strict();
+export const nearbyOfferSignalSchema = z.object({ kind: z.enum(["offer", "answer"]), sdp: z.string() }).strict();
+export const nearbyIceSignalSchema = z.object({ kind: z.literal("ice"), candidate: z.object({ candidate: z.string(), sdpMid: z.string().nullable().optional(), sdpMLineIndex: z.number().nullable().optional(), usernameFragment: z.string().nullable().optional() }).strict() }).strict();
+export const nearbySignalDataSchema = z.union([nearbyOfferSignalSchema, nearbyIceSignalSchema, connectRequestSchema]);
+export const nearbyEnableSchema = z.object({ type: z.literal("nearby-enable"), peerId: peerIdSchema, alias: nearbyAliasSchema }).strict();
+export const nearbyDisableSchema = z.object({ type: z.literal("nearby-disable") }).strict();
+export const nearbyRelaySchema = z.object({ type: z.literal("nearby-signal"), to: peerIdSchema, data: nearbySignalDataSchema }).strict();
+export const nearbyPeersSchema = z.object({ type: z.literal("nearby-peers"), peers: z.array(nearbyPeerSchema) }).strict();
+export const nearbyPeerJoinedSchema = z.object({ type: z.literal("nearby-peer-joined"), peer: nearbyPeerSchema }).strict();
+export const nearbyPeerLeftSchema = z.object({ type: z.literal("nearby-peer-left"), peerId: peerIdSchema }).strict();
+export const nearbyForwardedSignalSchema = z.object({ type: z.literal("nearby-signal"), from: peerIdSchema, data: nearbySignalDataSchema }).strict();
+export const nearbyGroupInfoSchema = z.object({ type: z.literal("nearby-group-info"), groupId: z.string().regex(/^[a-f0-9]{6}$/) }).strict();
+export const nearbyFileOfferSchema = z.object({ type: z.literal("nearby-file-offer"), transferId: z.number().int().nonnegative().max(0xffffffff), sealed: z.string().min(1) }).strict();
+export const nearbyFileAcceptSchema = z.object({ type: z.literal("nearby-file-accept"), transferId: z.number().int().nonnegative().max(0xffffffff) }).strict();
+export const nearbyFileRejectSchema = z.object({ type: z.literal("nearby-file-reject"), transferId: z.number().int().nonnegative().max(0xffffffff), reason: z.string().max(1000) }).strict();
+export const nearbyFileCompleteSchema = z.object({ type: z.literal("nearby-file-complete"), transferId: z.number().int().nonnegative().max(0xffffffff) }).strict();
+export const nearbyFileAckSchema = z.object({ type: z.literal("nearby-file-ack"), transferId: z.number().int().nonnegative().max(0xffffffff), ok: z.boolean(), reason: z.string().max(1000).optional() }).strict();
+export const nearbyFileCancelSchema = z.object({ type: z.literal("nearby-file-cancel"), transferId: z.number().int().nonnegative().max(0xffffffff), reason: z.string().max(1000).optional() }).strict();
+export const nearbyWorkspaceInviteSchema = z.object({ type: z.literal("workspace-invite"), inviteId: z.string().uuid(), secret: z.string().regex(/^[A-Za-z0-9_-]{43}$/), workspaceName: z.string().min(1).max(100), role: z.enum(["editor", "viewer"]), expiresAt: z.string().datetime() }).strict();
+export const nearbyInviteAckSchema = z.object({ type: z.literal("invite-ack"), inviteId: z.string().uuid(), declined: z.boolean() }).strict();
+export const nearbyControlPayloadSchema = z.discriminatedUnion("type", [nearbyFileOfferSchema, nearbyFileAcceptSchema, nearbyFileRejectSchema, nearbyFileCompleteSchema, nearbyFileAckSchema, nearbyFileCancelSchema, nearbyWorkspaceInviteSchema, nearbyInviteAckSchema]);
+export type NearbyControlPayload = z.infer<typeof nearbyControlPayloadSchema>;
+
 export const joinSchema = z.object({
   type: z.literal("join"),
   workspaceId: workspaceIdSchema,
@@ -77,6 +102,9 @@ export const clientMessageSchema = z.union([
   joinSchema,
   leaveSchema,
   relaySignalSchema,
+  nearbyEnableSchema,
+  nearbyDisableSchema,
+  nearbyRelaySchema,
 ]);
 
 export const joinedSchema = z.object({
@@ -160,6 +188,11 @@ export const serverMessageSchema = z.union([
   roleChangedSchema,
   kickedSchema,
   errorMessageSchema,
+  nearbyPeersSchema,
+  nearbyPeerJoinedSchema,
+  nearbyPeerLeftSchema,
+  nearbyForwardedSignalSchema,
+  nearbyGroupInfoSchema,
 ]);
 
 export const signalMessageSchema = z.union([
@@ -348,6 +381,9 @@ export type PongMessage = z.infer<typeof pongSchema>;
 export type JoinMessage = z.infer<typeof joinSchema>;
 export type LeaveMessage = z.infer<typeof leaveSchema>;
 export type SignalData = z.infer<typeof signalDataSchema>;
+export type NearbyPeer = z.infer<typeof nearbyPeerSchema>;
+export type NearbySignalData = z.infer<typeof nearbySignalDataSchema>;
+export type NearbyClientMessage = z.infer<typeof nearbyEnableSchema | typeof nearbyDisableSchema | typeof nearbyRelaySchema>;
 export type ClientSignalMessage = z.infer<typeof clientMessageSchema>;
 export type ServerSignalMessage = z.infer<typeof serverMessageSchema>;
 export type SignalMessage = z.infer<typeof signalMessageSchema>;

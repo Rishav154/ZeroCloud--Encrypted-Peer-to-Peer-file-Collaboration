@@ -308,6 +308,28 @@ export async function createWorkspaceInvite(
   role: "editor" | "viewer",
   expiresIn: "1h" | "24h" | "7d",
 ): Promise<{ link: string; invite: InviteRecord }> {
+  const { invite, secret } = await createInviteMaterial(token, workspace, role, expiresIn);
+  return {
+    link: `${process.env.NEXT_PUBLIC_WEB_ORIGIN ?? window.location.origin}/join/${invite.inviteId}#${secret}`,
+    invite,
+  };
+}
+
+export async function createNearbyWorkspaceInvite(
+  token: string,
+  workspace: WorkspaceView,
+  role: "editor" | "viewer",
+  expiresIn: "1h" | "24h",
+): Promise<{ invite: InviteRecord; secret: string }> {
+  return createInviteMaterial(token, workspace, role, expiresIn);
+}
+
+async function createInviteMaterial(
+  token: string,
+  workspace: WorkspaceView,
+  role: "editor" | "viewer",
+  expiresIn: "1h" | "24h" | "7d",
+): Promise<{ invite: InviteRecord; secret: string }> {
   const inviteId = crypto.randomUUID();
   const inviteSecret = crypto.getRandomValues(new Uint8Array(32));
   const wrappedKey = await sealInviteWorkspaceKey(
@@ -336,8 +358,9 @@ export async function createWorkspaceInvite(
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/g, "");
+  inviteSecret.fill(0);
   return {
-    link: `${process.env.NEXT_PUBLIC_WEB_ORIGIN ?? window.location.origin}/join/${inviteId}#${secretBase64}`,
+    secret: secretBase64,
     invite: {
       inviteId,
       role: invite.role,

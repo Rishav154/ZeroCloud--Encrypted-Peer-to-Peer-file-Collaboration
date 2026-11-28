@@ -4,12 +4,14 @@ import {
   type ServerSignalMessage,
   type WorkspaceMemberDirectory,
   type WorkspaceRole,
+  type NearbyPeer,
 } from "@zerocloud/shared";
 import type { Pool } from "pg";
 import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 import { verifySessionToken } from "./auth/session.js";
 import { logger } from "./logging.js";
+import { nearbyGroupKey, withinWindow } from "./nearby.js";
 
 type MemberRecord = {
   user_id: string;
@@ -27,6 +29,13 @@ type SocketState = {
   authTimer: ReturnType<typeof setTimeout>;
   queue: Promise<void>;
   userSlotAcquired: boolean;
+  clientIp: string;
+  nearby: NearbyPeer | null;
+  nearbyGroup: string | null;
+  nearbyPeerId: string | null;
+  nearbyEnableTimes: number[];
+  nearbySignalTimes: number[];
+  nearbyUserSlot: boolean;
 };
 
 export type UserConnectionLimiter = {
@@ -36,14 +45,17 @@ export type UserConnectionLimiter = {
 
 export class WorkspaceHub {
   private readonly rooms = new Map<string, Map<string, SocketState>>();
+  private readonly nearbyGroups = new Map<string, Map<string, SocketState>>();
+  private readonly nearbyUserCounts = new Map<string, number>();
 
   constructor(
     private readonly pool: Pool,
     private readonly jwtSecret: string,
     private readonly connectionLimits?: UserConnectionLimiter,
+    private readonly nearbySecret = "",
   ) {}
 
-  accept(socket: WebSocket): void {
+  accept(socket: WebSocket, clientIp = "unknown"): void {
     const state: SocketState = {
       connectionId: randomUUID().slice(0, 8),
       socket,
@@ -56,6 +68,13 @@ export class WorkspaceHub {
       }, 5000),
       queue: Promise.resolve(),
       userSlotAcquired: false,
+      clientIp,
+      nearby: null,
+      nearbyGroup: null,
+      nearbyPeerId: null,
+      nearbyEnableTimes: [],
+      nearbySignalTimes: [],
+      nearbyUserSlot: false,
     };
     state.authTimer.unref();
     this.log(null, null, `connected:${state.connectionId}`);
@@ -75,6 +94,8 @@ export class WorkspaceHub {
       if (state.userSlotAcquired && state.userId) {
         this.connectionLimits?.releaseUser(state.userId);
       }
+      this.removeNearby(state);
+      this.releaseNearbyUserSlot(state);
       const wasJoined = Boolean(state.workspaceId && state.peer);
       this.removePeer(state, `disconnect:${state.connectionId}`);
       if (!wasJoined)
@@ -217,6 +238,9 @@ export class WorkspaceHub {
       this.removePeer(state, "leave");
       return;
     }
+    if (message.type === "nearby-enable") { await this.enableNearby(state, message.peerId, message.alias); return; }
+    if (message.type === "nearby-disable") { if (!this.rateNearby(state, "enable")) return; this.removeNearby(state); return; }
+    if (message.type === "nearby-signal") { this.relayNearby(state, message.to, message.data); return; }
     if (message.type !== "signal") return;
     if (!state.workspaceId || !state.peer) {
       this.sendError(
@@ -246,6 +270,80 @@ export class WorkspaceHub {
       state.peer.peerId,
       `signal-relayed-${message.data.kind}`,
     );
+  }
+
+  private async enableNearby(state: SocketState, peerId: string, alias: string): Promise<void> {
+    if (!this.rateNearby(state, "enable")) return;
+    if (state.nearby) { this.sendError(state, "NOT_ENABLED", "Nearby is already enabled"); return; }
+    if (!state.userId) return;
+    const count = this.nearbyUserCounts.get(state.userId) ?? 0;
+    if (count >= 3) { this.sendError(state, "GROUP_FULL", "Maximum nearby-enabled sockets reached"); return; }
+    this.nearbyUserCounts.set(state.userId, count + 1);
+    state.nearbyUserSlot = true;
+    let groupKey: string;
+    try { groupKey = nearbyGroupKey(this.nearbySecret, state.clientIp); }
+    catch { this.releaseNearbyUserSlot(state); this.sendError(state, "NOT_ENABLED", "Could not determine network group"); return; }
+    let group = this.nearbyGroups.get(groupKey);
+    if (group?.has(peerId)) { this.releaseNearbyUserSlot(state); this.sendError(state, "NOT_ENABLED", "Peer ID is already in use"); return; }
+    if (group && group.size >= 50) { this.releaseNearbyUserSlot(state); this.sendError(state, "GROUP_FULL", "Nearby group is full"); return; }
+    if (!group) { group = new Map(); this.nearbyGroups.set(groupKey, group); }
+    state.nearbyGroup = groupKey; state.nearbyPeerId = peerId; group.set(peerId, state);
+    let result;
+    try { result = await this.pool.query<{ fingerprint: string; key_alg: "X25519" | "P-256" }>("SELECT fingerprint, key_alg FROM users WHERE id = $1", [state.userId]); }
+    catch { this.removeNearby(state); this.sendError(state, "NOT_ENABLED", "Could not load nearby identity"); return; }
+    if (state.socket.readyState !== WebSocket.OPEN) { this.removeNearby(state); return; }
+    const identity = result.rows[0];
+    if (!identity) { this.removeNearby(state); return; }
+    const peer: NearbyPeer = { peerId, alias, fingerprint: identity.fingerprint, keyAlg: identity.key_alg };
+    const peers = [...group.values()].map((entry) => entry.nearby).filter((entry): entry is NearbyPeer => entry !== null);
+    state.nearby = peer; state.nearbyGroup = groupKey; group.set(peerId, state);
+    this.send(state.socket, { type: "nearby-peers", peers });
+    this.send(state.socket, { type: "nearby-group-info", groupId: groupKey.slice(0, 6) });
+    this.broadcastNearby(groupKey, { type: "nearby-peer-joined", peer }, state);
+    logger.debug({ groupId: groupKey.slice(0, 6), event: "nearby-enabled" }, "nearby event");
+  }
+
+  private relayNearby(state: SocketState, to: string, data: import("@zerocloud/shared").NearbySignalData): void {
+    if (!this.rateNearby(state, "signal")) return;
+    if (!state.nearby || !state.nearbyGroup) { this.sendError(state, "NOT_ENABLED", "Enable Nearby before signaling"); return; }
+    const target = this.nearbyGroups.get(state.nearbyGroup)?.get(to);
+    if (!target?.nearby) { this.sendError(state, "NOT_ENABLED", "Target is not nearby-enabled"); return; }
+    this.send(target.socket, { type: "nearby-signal", from: state.nearby.peerId, data });
+  }
+
+  private rateNearby(state: SocketState, kind: "enable" | "signal"): boolean {
+    const now = Date.now();
+    const list = kind === "enable" ? state.nearbyEnableTimes : state.nearbySignalTimes;
+    const recent = withinWindow(list, now, 60_000);
+    const limit = kind === "enable" ? 6 : 120;
+    if (recent.length >= limit) { this.sendError(state, "RATE_LIMITED", "Nearby rate limit exceeded"); return false; }
+    recent.push(now);
+    if (kind === "enable") state.nearbyEnableTimes = recent; else state.nearbySignalTimes = recent;
+    return true;
+  }
+
+  private removeNearby(state: SocketState): void {
+    const peer = state.nearby;
+    const key = state.nearbyGroup;
+    const peerId = state.nearbyPeerId;
+    if (!key || !peerId) return;
+    const group = this.nearbyGroups.get(key);
+    group?.delete(peerId);
+    if (group) { if (peer) this.broadcastNearby(key, { type: "nearby-peer-left", peerId: peer.peerId }); if (!group.size) this.nearbyGroups.delete(key); }
+    state.nearby = null; state.nearbyGroup = null; state.nearbyPeerId = null;
+    this.releaseNearbyUserSlot(state);
+    logger.debug({ groupId: key.slice(0, 6), event: "nearby-left" }, "nearby event");
+  }
+
+  private releaseNearbyUserSlot(state: SocketState): void {
+    if (!state.nearbyUserSlot || !state.userId) return;
+    const count = this.nearbyUserCounts.get(state.userId) ?? 0;
+    if (count <= 1) this.nearbyUserCounts.delete(state.userId); else this.nearbyUserCounts.set(state.userId, count - 1);
+    state.nearbyUserSlot = false;
+  }
+
+  private broadcastNearby(groupKey: string, message: import("@zerocloud/shared").ServerSignalMessage, except?: SocketState): void {
+    for (const state of this.nearbyGroups.get(groupKey)?.values() ?? []) if (state !== except && state.nearby) this.send(state.socket, message);
   }
 
   private async join(

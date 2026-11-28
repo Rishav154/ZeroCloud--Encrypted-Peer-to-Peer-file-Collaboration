@@ -28,11 +28,15 @@ Set these under Render's environment settings. Values marked **secret** must be 
 | `ALLOWED_ORIGIN` | No | Exact Vercel production origin, e.g. `https://zerocloud.example.com` |
 | `WEB_ORIGIN` | No | Same public Vercel origin, used in invite links |
 | `JWT_SECRET` | **Yes** | Random value of at least 32 characters; not the example placeholder |
+| `NEARBY_SECRET` | **Yes** | Independent random server-only secret of at least 32 characters for nearby group HMACs |
+| `TRUST_PROXY_HOPS` | No | Nonnegative integer, default `1`; selects the trusted X-Forwarded-For entry counting from the right; `0` uses the socket address |
 | `DB_POOL_MAX` | No | Optional; default `10` |
 | `DB_IDLE_TIMEOUT_MS` | No | Optional; default `30000` |
 | `DB_CONNECTION_TIMEOUT_MS` | No | Optional; default `15000` |
 
 Set these in Vercel project settings. Select monorepo root directory `apps/web`, enable inclusion of source files outside the root directory, and use pnpm 10. Vercel must be able to install the root workspace and build `packages/shared`.
+
+Nearby grouping depends on the proxy chain seen by Render. Render and Cloudflare can each append or replace `X-Forwarded-For`; set `TRUST_PROXY_HOPS` to the count that selects the intended client address from the right, and never choose the spoofable leftmost entry. On local development, IPv4 and IPv6 loopback addresses normalize to the same group so separate browser profiles can discover each other on one machine. Verify deployment by enabling Nearby on two devices on the same WiFi and comparing the six-character group ID shown on `/nearby` and `/preflight`. Then compare a mobile-data device, which should normally get a different ID. If same-network IDs differ, adjust `TRUST_PROXY_HOPS` in Render and redeploy. Do not add raw forwarded addresses to application logs while diagnosing the chain; use the group-ID comparison.
 
 Use install command `cd ../.. && pnpm install --frozen-lockfile` and build command `cd ../.. && pnpm --filter @zerocloud/shared build && pnpm --filter @zerocloud/web build`. The web package build checks the production WSS URL before invoking Next.js.
 
@@ -54,7 +58,7 @@ Use install command `cd ../.. && pnpm install --frozen-lockfile` and build comma
 
 1. Create a GitHub repository and push the project. Enable Actions; confirm the `CI` workflow passes on the deployment branch.
 2. Create a Neon project and database. Copy both the pooled URL (for `DATABASE_URL`) and direct URL (for `DIRECT_DATABASE_URL`) into a secure password manager.
-3. Create a Render Blueprint from the repository and review `render.yaml`. Enter the secret values as secret environment variables and set the web origin values after Vercel deployment. Render starts the service with migrations before it begins listening; `/health` is its health check.
+3. Create a Render Blueprint from the repository and review `render.yaml`. Enter `JWT_SECRET`, `NEARBY_SECRET`, database values as secret environment variables and set the web origin values after Vercel deployment. Render starts the service with migrations before it begins listening; `/health` is its health check.
 4. Create a Vercel project from the same repository with root directory `apps/web`. Enable workspace files outside the root directory. Set the public API, WSS, web-origin, STUN, and optional TURN variables above, then deploy.
 5. Copy the final Vercel origin into Render's `ALLOWED_ORIGIN` and `WEB_ORIGIN`, save, and redeploy Render. Check Render `/health`; `db` must be `up` and status `ok`.
 6. Open `https://<web-origin>/preflight` on a laptop and a phone. Check secure context, signaling, database status, ICE candidate types, and build IDs. Then run the two-account invite, secure handshake, and file-sync demo over WiFi and mobile data.
@@ -83,6 +87,8 @@ For a recovery drill, restore into a scratch database URL by temporarily setting
 The Next.js proxy generates a fresh nonce per request. CSP `connect-src` is constructed from the configured API origin, signaling origin (both HTTPS and WSS), and configured STUN/TURN hosts. Keep the public STUN/TURN URLs aligned with hosts the deployed browser may contact. The nonce-based policy avoids `unsafe-inline` for scripts. Development alone permits `unsafe-eval` for the dev runtime. Nonces require dynamically rendered pages; this is acceptable for this app. Styles use self and nonce sources; if a component library introduces inline styles, verify the browser console before making a narrowly scoped change.
 
 The API sends `Cache-Control: no-store`. HTTP errors return generic messages and include a request ID for server-side log correlation. Structured server logs redact authorization, password, token, wrapped-key, sealed-payload, and secret fields. WebSocket payloads are capped at 256 KiB; per-IP and per-user socket limits are enforced. The signal server checks the browser origin against `ALLOWED_ORIGIN`.
+
+Nearby is opt-in and groups enabled devices by HMAC of the normalized public client IP; it is a same-public-IP feature, not LAN proximity detection. CGNAT, VPNs, and campus or office NAT can group strangers or split devices on one physical network. The signal service temporarily holds aliases, peer IDs, fingerprints, and group membership in memory and learns the connecting IP to derive the group; it does not persist nearby membership. Nearby peers see each other's chosen aliases and identity fingerprints, never account names or workspace membership. Verify fingerprints out of band when needed: a malicious signal server could list a fake peer, though the client checks the hello fingerprint against the server-listed fingerprint. Strangers can attempt connection handshakes; manual acceptance for files/invites, request limits, and blocking mitigate later spam.
 
 ## CI
 

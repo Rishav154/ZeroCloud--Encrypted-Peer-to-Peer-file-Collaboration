@@ -23,3 +23,7 @@ services:
         sync: false
       - key: JWT_SECRET
         sync: false
+      - key: NEARBY_SECRET
+        sync: false
+      - key: TRUST_PROXY_HOPS
+        value: "1"

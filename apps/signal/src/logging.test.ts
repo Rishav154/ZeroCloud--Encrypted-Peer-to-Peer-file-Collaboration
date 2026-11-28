@@ -39,4 +39,15 @@ describe("structured log redaction", () => {
     }
     expect(output.match(/\[REDACTED\]/g)).toHaveLength(7);
   });
+
+  it("allows only the short nearby group ID in nearby diagnostics", () => {
+    let output = "";
+    const destination = new Writable({ write(chunk: Uint8Array, _encoding, callback) { output += chunk.toString(); callback(); } });
+    const logger = createLogger(destination);
+    const groupKey = "0123456789abcdef".repeat(4);
+    logger.debug({ groupId: groupKey.slice(0, 6), event: "nearby-enabled" }, "nearby event");
+    expect(output).toContain('"groupId":"012345"');
+    expect(output).not.toContain(groupKey);
+    expect(output).not.toContain("198.51.100.42");
+  });
 });

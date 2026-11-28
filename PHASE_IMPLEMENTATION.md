@@ -395,3 +395,29 @@ Checkpoint B gates the active workspace data plane on proof of the current works
 ### Checkpoint B limits
 
 The cleartext header reveals message type, workspace ID, key version, sequence, and fragment size/count to the connected peer browser, but is never sent through the signalling server. DataChannels also use DTLS. Chat is transport-encrypted but not workspace-key encrypted. A current-key proof establishes key possession, not honest behavior; members can retain old plaintext and may collude with a current member who shares new content.
+
+## Phase 9 — Nearby discovery (Checkpoints A and B)
+
+### Aim and scope
+
+Nearby adds an opt-in, same-network discovery path that remains separate from workspace rooms and workspace peer connections. Checkpoint A provides group discovery, authenticated peer directories, connect requests, deterministic offerer selection, and an identity-checked secure DataChannel. Checkpoint B adds manual-accept file transfer and workspace invites over that channel.
+
+### Signalling and grouping
+
+- `NEARBY_SECRET` is a server-only HMAC key. `TRUST_PROXY_HOPS` selects the trusted `X-Forwarded-For` address from the right; zero uses the socket address. Nearby groups use an HMAC of the normalized address, and the six-character group ID is diagnostic only. IPv4 and IPv6 loopback normalize to one local group for two-browser development on the same machine. Deployed grouping is by public IP, not LAN proximity.
+- `nearby-enable` includes only a UUID peer ID and a validated user alias. The signal service attaches the registered identity fingerprint and key algorithm from the authenticated account. Groups are in-memory, limited to 50 peers, and allow at most three nearby-enabled sockets per account.
+- Strict `nearby-signal` data accepts offer, answer, ICE, and `{kind: "connect-request"}` with no extra fields. The server relays only among nearby-enabled sockets in the same group; it never sends these messages into workspace rooms. Relayed signals use the existing 120-per-minute per-socket limit. The protocol tables and strict schemas are in the README and shared package.
+- The lexicographically smaller peer ID is always the offerer. A click on a larger ID sends a connect request; the smaller peer starts an offer if it has no active attempt. This handles simultaneous clicks and ignores duplicate requests while an attempt is active. Incoming requests require nearby to be enabled, a listed and unblocked peer, fewer than eight active nearby connections, and no more than five earlier requests from that peer in the rolling minute. Excess requests are counted in the debug counter. A requester that receives no offer within ten seconds enters failed state and can retry with another request.
+- The connect request carries no identity or secret and does not require a prompt. Each DataChannel performs the Phase 4 hello fingerprint check against the server-listed fingerprint, derives a session key, and exchanges a sealed ready confirmation. An early ready message is queued while local key derivation is pending, then validated once the key is available. The `zc-nearby` channel whitelist accepts only hello, ready, and the nearby sealed-control envelope; workspace sync, manifest, proof, chat, and unknown messages are dropped.
+
+### Quick Send and workspace invites
+
+- Quick Send reuses the existing chunked transfer pipeline over the nearby channel. Metadata is sealed, the recipient must manually accept, chunks remain in memory, and the receiver must download only after digest verification. Nearby files are not written to a workspace library. The receiver declines a fourth pending offer per peer, offers beyond ten in a minute, and offers from blocked fingerprints.
+- Nearby control messages use a strict AES-GCM sealed envelope capped at 4 KiB, with an increasing sequence number and replay rejection. The AAD binds protocol, message type, and both fingerprints. Blocked fingerprints persist in the local browser profile.
+- Workspace invitations reuse the existing invite endpoint. The sender confirms disclosure of the workspace name. The receiver sees it as sender-stated and unverified, then manually accepts or declines. The invite secret stays in browser memory and travels only in the sealed nearby control. Accept redeems directly without a secret-bearing URL; decline or expiry triggers revocation.
+
+### Limits, privacy, and verification
+
+- The signal service temporarily holds aliases, peer IDs, fingerprints, group membership, and the client address used to compute the group. It does not persist nearby membership or the address. Nearby peers learn aliases and fingerprints, not account names or workspace membership. NAT, VPNs, and shared public IPs can group unrelated devices; matching group IDs do not prove proximity. A malicious signal server can list a forged peer, but the client rejects a DataChannel hello whose fingerprint differs from the listed fingerprint.
+- Signal tests cover strict schema parsing, same-group relaying, workspace-room isolation, per-socket limits, and loopback normalization. Client tests cover offerer policy, duplicate and blocked requests, request and connection limits, retry timeout, channel whitelist, and sealed controls. The complete manual transfer/invite workflow is documented in the Phase 9 section of the README.
+- Local two-browser verification: run `pnpm dev`, sign in to separate accounts in separate browser profiles, enable Nearby in both, compare group IDs, connect, then accept a small file offer and a test workspace invite. Repeat with decline and block. For deployment, compare IDs on two devices on the same WiFi and a device on mobile data; tune `TRUST_PROXY_HOPS` if the proxy chain selects different client addresses. See `docs/DEPLOYMENT.md`.

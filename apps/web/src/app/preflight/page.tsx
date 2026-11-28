@@ -7,9 +7,10 @@ import { Card, CardContent, CardHeader, CardTitle } from "../../components/ui/ca
 import { loadExistingIdentity } from "../../lib/identity/identityStore";
 import { useAuthStore } from "../../lib/auth/session";
 import { publicConfig } from "../../lib/config";
+import { useNearbyStore } from "../../lib/nearby/nearby-store";
 
 type CheckStatus = "checking" | "green" | "red" | "amber";
-type CheckId = "secure" | "crypto" | "indexeddb" | "health" | "websocket" | "ice" | "identity" | "build";
+type CheckId = "secure" | "crypto" | "indexeddb" | "health" | "websocket" | "ice" | "identity" | "build" | "nearby";
 type CheckResult = { id: CheckId; title: string; status: CheckStatus; detail: string; measuredAt: number };
 
 const titles: Record<CheckId, string> = {
@@ -21,6 +22,7 @@ const titles: Record<CheckId, string> = {
   ice: "ICE gathering",
   identity: "Browser identity",
   build: "Build information",
+  nearby: "Nearby",
 };
 
 const initialResults = (): Record<CheckId, CheckResult> => Object.fromEntries(
@@ -130,6 +132,7 @@ export default function PreflightPage() {
             })}
           </CardContent>
         </Card>
+        <p className="text-sm text-zinc-500">Two devices on the same network should show the same group id; if they don&apos;t, check TRUST_PROXY_HOPS.</p>
         {copyStatus && <p role="status" className="text-sm text-zinc-400">{copyStatus}</p>}
       </div>
     </main>
@@ -137,6 +140,11 @@ export default function PreflightPage() {
 }
 
 async function runCheckTask(id: CheckId): Promise<{ status: CheckStatus; detail: string }> {
+  if (id === "nearby") {
+    if (!useAuthStore.getState().accessToken || !useNearbyStore.getState().enabled) return { status: "amber", detail: "off" };
+    const nearby = useNearbyStore.getState();
+    return { status: "green", detail: `Group ${nearby.groupId ?? "pending"}; ${Object.keys(nearby.peers).length} device(s)` };
+  }
   if (id === "secure") {
     const secure = window.isSecureContext && Boolean(globalThis.crypto?.subtle);
     return secure
