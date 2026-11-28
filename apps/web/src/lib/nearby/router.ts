@@ -1,6 +1,6 @@
 import { helloMessageSchema, nearbyControlEnvelopeSchema, readyMessageSchema } from "@zerocloud/shared";
 
-const nearbyTypes = new Set(["hello", "ready", "nearby-control"]);
+const nearbyTypes = new Set(["hello-commit", "hello", "ready", "nearby-control"]);
 const nearbyControlTypes = new Set(["nearby-file-offer", "nearby-file-accept", "nearby-file-reject", "nearby-file-complete", "nearby-file-ack", "nearby-file-cancel", "workspace-invite", "invite-ack"]);
 const workspaceTypes = new Set(["hello", "ready", "chat", "sync", "sync-file-offer", "file-offer", "file-accept", "file-reject", "file-complete", "file-ack", "file-cancel", "ws-proof", "stale-key"]);
 
@@ -15,6 +15,7 @@ export function routePeerMessage(channel: "zc-nearby" | "zc-data", value: unknow
   const allowed = channel === "zc-nearby" ? nearbyTypes : workspaceTypes;
   if (!allowed.has(type)) { onDrop?.(); return { accepted: false, reason: "wrong-channel" }; }
   if (type === "hello" && !helloMessageSchema.strict().safeParse(value).success) { onDrop?.(); return { accepted: false, reason: "invalid" }; }
+  if (type === "hello-commit" && (!openedNearbyControl && (!value || typeof value !== "object" || !("c" in value) || typeof value.c !== "string" || value.c.length > 128 || !/^[A-Za-z0-9+/]{43}=$/.test(value.c)))) { onDrop?.(); return { accepted: false, reason: "invalid" }; }
   if (type === "ready" && !readyMessageSchema.strict().safeParse(value).success) { onDrop?.(); return { accepted: false, reason: "invalid" }; }
   if (type === "nearby-control" && !nearbyControlEnvelopeSchema.safeParse(value).success) { onDrop?.(); return { accepted: false, reason: "invalid" }; }
   return { accepted: true, type };

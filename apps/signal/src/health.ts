@@ -11,6 +11,7 @@ export function createHealthHandler(
   config: HealthConfig,
   startedAt: number,
   now: () => number = Date.now,
+  nearbyCounts: () => { sockets: number; enabled: number; groups: number } = () => ({ sockets: 0, enabled: 0, groups: 0 }),
 ): RequestHandler {
   return async (_request, response) => {
     const db = await database.status();
@@ -21,6 +22,7 @@ export function createHealthHandler(
       uptime: Math.floor((now() - startedAt) / 1000),
       db,
       build: { sha: config.BUILD_SHA, time: config.BUILD_TIME },
+      nearby: nearbyCounts(),
     });
   };
 }

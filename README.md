@@ -1,5 +1,27 @@
 # ZeroCloud
 
+## Anonymous Nearby architecture and privacy
+
+The root route is the anonymous Nearby screen. Opening it makes the browser visible; leaving the route or hiding/closing the tab sends a best-effort disable and closes the socket. The dedicated `/ws/nearby` endpoint is separate from authenticated `/ws` and imports no database, auth, or workspace handler. It stores groups and signaling state in memory only. No account is used to form a nearby identity. The nearby key is non-extractable and kept in its own IndexedDB store; aliases and block lists are local browser data. Clearing site data creates a new nearby identity.
+
+The server sees the source IP for same-public-IP grouping and connection limits, but does not persist it or log it. Peers in the group can see each other's alias and SHA-256 public-key fingerprint, and can send connection requests and manual-accept file offers. Files and text are sealed between connected peers; text is displayed as plain text. Links never open automatically. The server validates public-key encoding and computes the listed fingerprint, but cannot prove private-key possession. The nearby handshake commits to each exact hello before revealing it; the resulting safety words help detect key substitution when both users compare them. A malicious server can still deny service or attempt an active relay attack. The words are meaningful only because of commit-then-reveal; four 11-bit words give an attacker a 2^-44 chance per attempt, and a failed attempt is visible as mismatching words.
+
+Anonymous Nearby defaults: 32 KiB payloads, 10 concurrent sockets per IP, 20 new connections per IP per minute, 30 peers per group, 6 enable/disable events per socket per minute, 120 signals per socket per minute, 15 seconds to enable, and 2000 global sockets. `NEARBY_MAX_SOCKETS` changes the global cap. `TRUST_PROXY_HOPS` selects the trusted X-Forwarded-For entry counted from the right (`0` uses the socket address; default `1`). `ALLOWED_ORIGIN` is checked on upgrades; this deters casual browser abuse only and is not authentication. See [deployment verification](docs/NEARBY_VERIFICATION.md) for deployment checks and the load script.
+
+| Signal environment variable | Default | Purpose |
+| --- | ---: | --- |
+| `NEARBY_SECRET` | required, at least 32 characters | Server-only HMAC secret for same-public-IP groups |
+| `NEARBY_MAX_SOCKETS` | `2000` | Global anonymous socket cap; excess upgraded sockets close with code `4425` |
+| `NEARBY_MAX_PAYLOAD_BYTES` | `32768` | WebSocket payload limit; configurable from 1024 through 32768 bytes |
+| `NEARBY_MAX_SOCKETS_PER_IP` | `10` | Concurrent anonymous sockets from one derived IP |
+| `NEARBY_NEW_CONNECTIONS_PER_MINUTE` | `20` | New anonymous WebSocket connections per derived IP |
+| `NEARBY_GROUP_CAP` | `30` | Enabled peers in one same-IP group |
+| `NEARBY_ENABLES_PER_MINUTE` | `6` | Nearby enable and disable messages per socket |
+| `NEARBY_SIGNALS_PER_MINUTE` | `120` | Relayed WebRTC signaling messages per socket |
+| `NEARBY_ENABLE_TIMEOUT_MS` | `15000` | Time allowed to send a valid `nearby-enable` after connecting |
+| `TRUST_PROXY_HOPS` | `1` | Trusted `X-Forwarded-For` hop count; `0` uses the socket address |
+| `ALLOWED_ORIGIN` | required | Exact browser Origin allowed to upgrade WebSockets |
+
 ZeroCloud is a browser-based peer-to-peer collaboration project. Files and file metadata are encrypted in the browser before travelling directly over WebRTC DataChannels. PostgreSQL stores accounts and workspace metadata, including sealed workspace names and wrapped workspace keys; it never receives plaintext files, workspace names, workspace keys, invite secrets, or private identity keys.
 
 ## Requirements
@@ -223,37 +245,32 @@ flowchart LR
 
 The nonce-based Content Security Policy is produced by the Next.js proxy from the configured API origin, HTTPS/WSS signaling origin, and configured STUN/TURN hosts. Pages are dynamically rendered to provide a fresh nonce; this is acceptable for this app. Development permits `unsafe-eval` for the Next dev runtime. Production does not permit inline scripts without the per-request nonce.
 
-## Phase 9: Nearby discovery
+## Anonymous Nearby discovery
 
-Nearby is opt-in. Authenticated browsers that enable it are grouped by an HMAC of their normalized public IP, using the server-only `NEARBY_SECRET`. `TRUST_PROXY_HOPS` selects the trusted X-Forwarded-For entry from the right (default `1`; `0` uses the socket address). The six-character group ID is diagnostic only. This is same-public-IP grouping, not LAN proximity: CGNAT, VPNs, and campus or office NAT may group strangers or split devices on one physical network. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Render/Cloudflare hop verification.
+`/` is the Nearby front door for signed-in and logged-out visitors. `/nearby` redirects to `/`. Opening the screen opts the tab into visible presence. The browser sends a best-effort disable and closes its anonymous socket on route exit or `pagehide`; server close detection is authoritative. Backgrounding and network changes reconnect and publish a fresh peer ID when visibility remains enabled.
 
-Nearby signaling messages:
+Nearby uses a dedicated unauthenticated `/ws/nearby` WebSocket endpoint. Its module owns in-memory groups and signaling state and imports no database, authentication, or workspace code. The authenticated `/ws` handles workspace and account signaling; the anonymous channel cannot reach those handlers. No Nearby presence, text, or transfer metadata is written to PostgreSQL. Health exposes only anonymous socket, enabled-peer, and group counts.
 
-| Direction | Message | Payload / rule |
-| --- | --- | --- |
-| Client → server | `nearby-enable` | `peerId` UUID and client-chosen `alias`; fingerprint and key algorithm come from the authenticated database identity |
-| Client → server | `nearby-disable` | Removes this socket from its in-memory group |
-| Client → server | `nearby-signal` | `to` peer UUID and offer, answer, ICE, or strict `{kind: "connect-request"}` (no other fields); up to 120 relayed signals per socket per minute |
-| Server → client | `nearby-peers`, `nearby-peer-joined`, `nearby-peer-left` | Alias, peer UUID, registered fingerprint, and key algorithm only; no account or workspace data |
-| Server → client | `nearby-signal` | Relay only when sender and recipient are nearby-enabled members of the same group; never routed through workspace rooms |
-| Server → client | `nearby-group-info` | Six-character group ID for preflight/debug |
+The server groups clients by an HMAC of normalized client IP using `NEARBY_SECRET`. `TRUST_PROXY_HOPS` selects the trusted X-Forwarded-For entry from the right (`0` uses the socket address; default `1`). This is same-public-IP grouping, not LAN discovery: CGNAT, VPNs, and office or campus NAT can group strangers or split devices on one physical network. The six-character group ID is diagnostic only. The server reads client IP for grouping and rate limits but never persists it or logs it. `ALLOWED_ORIGIN` is checked for WebSocket upgrades. Origin checks deter casual browser abuse only; scripted clients can set Origin.
 
-DataChannel control messages (for the Checkpoint B payloads) travel as a strict `{type:"nearby-control", v:1, messageType, seq, sealed}` envelope. The AES-GCM AAD is `zerocloud/v1/nearby || messageType || senderFingerprint || receiverFingerprint || uint32(seq)`; sequence numbers increase per connection and receivers reject replayed or older values. Sealed controls are capped at 4 KiB. The `zc-nearby` router accepts only `hello`, `ready`, and this envelope before decryption, then allows only the enumerated nearby file and invite controls after opening. Signaling `connect-request` never travels on the DataChannel.
+A nearby key is generated independently from account identity, non-extractable, and stored in a separate IndexedDB database. The fingerprint is SHA-256 of its raw public key. The server validates X25519 (32-byte raw key) or P-256 (65-byte uncompressed point) and computes the listed fingerprint itself. It cannot verify private-key possession; peers verify it with the nearby-only hello handshake. Aliases and fingerprint block lists are local browser storage. Clearing browser data silently creates a new device key and alias. Nearby peers can see each other's alias and fingerprint and can send connection requests, manual-accept file offers, and sealed text. No account name or workspace membership is disclosed by Nearby.
 
-Only the lexicographically smaller `peerId` creates an offer. Clicking a larger ID sends a connect-request; the smaller peer offers in response. Duplicate requests during an attempt are ignored, and simultaneous clicks still produce one offer. Incoming requests are ignored if the sender is not listed, its fingerprint is blocked, it has sent six requests in a minute, or eight connections are already active. A requester fails after ten seconds without an offer and can retry. A connect-request contains no identity or secret; the subsequent Phase 4 hello fingerprint must match the server-listed fingerprint, and the ready confirmation is session-key sealed with the existing Phase 4 handshake. If the remote ready arrives while local session-key derivation is still in progress, the client queues it until the key is available and then validates it. Nearby connections are separate from workspace `PeerManager` connections. They use the `zc-nearby` channel whitelist, which drops workspace sync, manifest, proof, chat, and unknown message types.
+The Phase 4 hello fields remain unchanged. On the nearby channel only, each side commits to SHA-256 of the exact hello JSON string before revealing hello (`hello-commit`, at most 128 bytes). A hello without a prior commitment, a duplicate commitment, or a commitment mismatch fails and closes the channel. The session key then seals the ready confirmation. Safety words use `sas-wordlist-v1`: SHA-256 of UTF-8 `zerocloud/v1/sas` followed by the two raw 32-byte fingerprints sorted bytewise and the two raw 32-byte hello nonces sorted independently bytewise. The digest is read MSB-first as consecutive 11-bit indices into the bundled 2048-entry list; the first four words are shown only when the user chooses Verify. The words are meaningful only because of commit-then-reveal. The 44 bits give an attacker a 2^-44 chance per attempt; a failed attempt appears to users as mismatching words. Compare them over a trusted channel. A malicious server can still deny service or attempt an active relay attack.
 
-The signal service keeps nearby groups in memory only, with a 50-peer group cap, three enabled sockets per account, and per-socket signaling limits. It learns the client IP for grouping but does not persist it or the group. Local IPv4 and IPv6 loopback addresses share a group, so two browser profiles opened on the same development machine can discover each other. Nearby peers see aliases and fingerprints; they do not learn account names or workspace membership. A malicious server could list a fake peer; fingerprint verification mitigates impersonation. See `/nearby` for the opt-in toggle, device states, transfers, invitations, and fingerprint block list.
+| Limit | Default |
+| --- | ---: |
+| WebSocket payload | 32 KiB |
+| Concurrent sockets per IP | 10 |
+| New connections per IP | 20 per minute |
+| Peers per group | 30 |
+| Enable/disable per socket | 6 per minute |
+| Relayed signals per socket | 120 per minute |
+| Time to enable after connect | 15 seconds |
+| Global anonymous sockets | `NEARBY_MAX_SOCKETS=2000` |
+| Heartbeat | 20 seconds; terminate after 2 missed pongs |
 
-Quick Send reuses the existing sealed file metadata and chunk transfer implementation over the isolated `zc-nearby` channel. Every offer requires manual acceptance. Incoming data stays in memory until completion and SHA-256 verification; the recipient must click Download. Nearby transfers are never added to a workspace library. The receiver auto-declines a fourth pending offer per peer, offers beyond ten per minute, and offers from blocked fingerprints. Blocked fingerprints are stored in localStorage; transfer history is not persisted.
+File transfers reuse the existing sealed metadata and chunk transfer implementation over `zc-nearby`. Every transfer requires manual acceptance. Receivers allow at most three pending offers per peer and ten offers per peer per minute; excess and blocked-fingerprint offers are auto-declined. Text is sealed with the nearby control AAD, capped at 4 KiB, replay-protected, and rendered as plain text. A link is never opened or linked automatically; the explicit Open action requires a single trimmed HTTP(S) URL of at most 2048 characters without username or password and shows its ASCII hostname.
 
-Nearby workspace invites are created through the existing Phase 5/7 invite endpoint. The server stores only the sealed invite material; the secret remains in browser memory and is sent inside the sealed nearby control. The sender confirms workspace-name disclosure; the receiver sees the name labeled as stated by sender and unverified. Accept calls the existing redeem function directly without a secret-bearing URL. Declining or expiry sends an acknowledgement so the sender revokes the invite. Membership and workspace access still begin only after redemption.
+Workspace invites remain account-based for workspace owners and travel sealed over Nearby. The recipient may accept while logged out; the invite secret stays in root-provider memory during client-side login or registration and is redeemed through the existing flow. A reload loses this in-memory secret; the sender's server-backed pending-invite list remains authoritative until expiry or revoke. Invite acknowledgement is best-effort.
 
-Quick verification flow: use two authenticated accounts on one WiFi, enable Nearby, connect, send a small file and accept it manually, then send a one-hour workspace invite and redeem it on the second account. Repeat with Decline and Block, and verify the blocked fingerprint appears in the Unblock list. For Render proxy verification, compare `/preflight` group IDs on two same-network devices and adjust `TRUST_PROXY_HOPS` if needed.
-
-For the development-only whitelist check, build with `NEXT_PUBLIC_DEBUG_NEARBY=true`, connect a secure peer, and use the Debug buttons to send `sync` and `manifest`; both should be dropped and increment the counter.
-
-Manual check: use two distinct accounts in separate browser profiles, enable Nearby in both, compare group IDs, connect, and confirm secure state and matching fingerprints. On one development machine, IPv4 and IPv6 loopback addresses share a group. Turning Nearby off removes the peer; reloading starts with Nearby off. A mobile-data device should normally receive a different group ID. Do not interpret matching group IDs as proof of physical proximity.
-
-`pnpm db:backup` creates a timestamped custom-format dump under `backups/`. `pnpm db:restore -- <file>` asks for the exact word `RESTORE` before replacing objects in the configured direct database. Use a scratch database for restore drills. `pnpm check:client-secrets` builds the web bundle and scans it for server-side env values where available; CI runs this after build.
-
-`pnpm e2e:smoke` runs the single approved two-context browser smoke flow. Its CI job is separate and non-blocking because headless WebRTC can be flaky. If that occurs, run it locally with a started PostgreSQL 16 service and documented local environment; do not treat the e2e result as the CI quality gate.
+For a deployment-level transfer, database, invitation, proxy, log, and load checklist, see [docs/NEARBY_VERIFICATION.md](docs/NEARBY_VERIFICATION.md). The conservative socket-cap check is `pnpm test:load-nearby wss://signal.example.com/ws/nearby`; it opens ten sockets and expects the eleventh to be refused with HTTP 429. At the global cap, the server closes the accepted socket with code `4425` and reason `Nearby global capacity reached (NEARBY_MAX_SOCKETS)`.

@@ -7,6 +7,11 @@ describe("peer message channel router", () => {
     expect(routePeerMessage("zc-nearby", hello).accepted).toBe(true);
     expect(routePeerMessage("zc-data", hello).accepted).toBe(true);
   });
+  it("allows hello-commit only on nearby with a bounded base64 digest", () => {
+    expect(routePeerMessage("zc-nearby", { type: "hello-commit", c: "A".repeat(43) + "=" }).accepted).toBe(true);
+    expect(routePeerMessage("zc-nearby", { type: "hello-commit", c: "x".repeat(129) }).accepted).toBe(false);
+    expect(routePeerMessage("zc-data", { type: "hello-commit", c: "A".repeat(43) + "=" }).accepted).toBe(false);
+  });
   it.each(["nearby-file-offer", "nearby-file-accept", "nearby-file-reject", "nearby-file-complete", "nearby-file-ack", "nearby-file-cancel", "workspace-invite", "invite-ack"])("recognizes the opened Checkpoint B control %s", (type) => {
     expect(routePeerMessage("zc-nearby", { type }, undefined, true).accepted).toBe(true);
   });

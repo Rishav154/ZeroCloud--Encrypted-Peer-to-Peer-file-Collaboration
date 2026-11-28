@@ -141,7 +141,7 @@ export default function PreflightPage() {
 
 async function runCheckTask(id: CheckId): Promise<{ status: CheckStatus; detail: string }> {
   if (id === "nearby") {
-    if (!useAuthStore.getState().accessToken || !useNearbyStore.getState().enabled) return { status: "amber", detail: "off" };
+    if (!useNearbyStore.getState().enabled) return { status: "amber", detail: "off" };
     const nearby = useNearbyStore.getState();
     return { status: "green", detail: `Group ${nearby.groupId ?? "pending"}; ${Object.keys(nearby.peers).length} device(s)` };
   }

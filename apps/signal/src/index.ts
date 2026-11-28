@@ -14,6 +14,7 @@ import { httpLogger, logger } from "./logging.js";
 import { WorkspaceHub } from "./workspaceHub.js";
 import { buildInfo } from "./build-info.generated.js";
 import { deriveClientIp } from "./nearby.js";
+import { attachAnonymousNearby } from "./anonymousNearby.js";
 
 async function start(): Promise<void> {
   const startupPool = createDatabasePool(config.DIRECT_DATABASE_URL, {
@@ -44,6 +45,7 @@ async function start(): Promise<void> {
   const workspaceHub = new WorkspaceHub(pool, config.JWT_SECRET, connectionLimits, config.NEARBY_SECRET);
   const app = express();
   const server = createServer(app);
+  const anonymousNearby = attachAnonymousNearby(server, config);
   const sockets = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
   const alive = new WeakMap<WebSocket, boolean>();
   const ipBySocket = new WeakMap<WebSocket, string>();
@@ -57,7 +59,7 @@ async function start(): Promise<void> {
   app.get("/health", createHealthHandler(databaseHealth, {
     BUILD_SHA: buildInfo.sha,
     BUILD_TIME: buildInfo.time,
-  }, startedAt));
+  }, startedAt, Date.now, anonymousNearby.counts));
 
   const requestErrorHandler: ErrorRequestHandler = (error, _request, response, _next) => {
     void _next;
@@ -78,6 +80,7 @@ async function start(): Promise<void> {
   app.use(requestErrorHandler);
 
   server.on("upgrade", (request, socket, head) => {
+    if (request.url === "/ws/nearby") return;
     if (request.url !== "/ws" || request.headers.origin !== config.ALLOWED_ORIGIN) {
       socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
       socket.destroy();
@@ -122,6 +125,7 @@ async function start(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     clearInterval(heartbeat);
+    anonymousNearby.close();
     for (const socket of sockets.clients) socket.close(1001, "Server shutting down");
     sockets.close(() => {
       server.close(() => {

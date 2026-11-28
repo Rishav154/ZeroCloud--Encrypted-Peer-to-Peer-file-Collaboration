@@ -11,7 +11,8 @@
     "db:migrate": "tsx src/db/migrate-cli.ts",
     "db:backup": "tsx src/db/backup.ts",
     "db:restore": "tsx src/db/restore.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:load-nearby": "node scripts/nearby-load.mjs"
   },
   "dependencies": {
     "@zerocloud/shared": "workspace:*",

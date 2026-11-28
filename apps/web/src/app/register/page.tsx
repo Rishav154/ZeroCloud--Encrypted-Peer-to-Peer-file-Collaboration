@@ -18,6 +18,7 @@ import {
   registerAccount,
 } from "../../lib/auth/api";
 import { useAuthStore } from "../../lib/auth/session";
+import { getPostAuthPath } from "../../lib/auth/returnPath";
 
 function fullFingerprint(fingerprint: string): string {
   return fingerprint.match(/.{1,4}/g)?.join(" ") ?? fingerprint;
@@ -55,7 +56,7 @@ export default function RegisterPage() {
         identity,
       );
       setSession(session);
-      router.replace("/workspaces");
+      router.replace(getPostAuthPath());
     } catch (caught) {
       if (
         caught instanceof ApiError &&

@@ -238,9 +238,6 @@ export class WorkspaceHub {
       this.removePeer(state, "leave");
       return;
     }
-    if (message.type === "nearby-enable") { await this.enableNearby(state, message.peerId, message.alias); return; }
-    if (message.type === "nearby-disable") { if (!this.rateNearby(state, "enable")) return; this.removeNearby(state); return; }
-    if (message.type === "nearby-signal") { this.relayNearby(state, message.to, message.data); return; }
     if (message.type !== "signal") return;
     if (!state.workspaceId || !state.peer) {
       this.sendError(

@@ -1,4 +1,4 @@
-import { base64ToBytes, bytesToBase64, compareBytes, deriveSessionKey, fileControlMessageSchema, fingerprintPublicKey, helloMessageSchema, nearbyControlEnvelopeSchema, nearbyControlPayloadSchema, open, openNearbyControl, NearbyReplayGuard, readyMessageSchema, readyPayloadSchema, seal, utf8, type FileControlMessage, type NearbyControlPayload, type NearbyPeer, type NearbySignalData } from "@zerocloud/shared";
+import { base64ToBytes, bytesToBase64, compareBytes, deriveSessionKey, fileControlMessageSchema, fingerprintPublicKey, helloMessageSchema, nearbyControlEnvelopeSchema, nearbyControlPayloadSchema, nearbyTextPayloadSchema, open, openNearbyControl, NearbyReplayGuard, readyMessageSchema, readyPayloadSchema, seal, utf8, type FileControlMessage, type NearbyControlPayload, type NearbyPeer, type NearbySignalData } from "@zerocloud/shared";
 import type { StoredIdentity } from "../identity/identityStore";
 import { localToRemoteAad, remoteToLocalAad, type PeerCryptoContext } from "../transfer/cryptoContext";
 import { FileSender } from "../transfer/FileSender";
@@ -8,11 +8,13 @@ import { TypedEventEmitter } from "../webrtc/TypedEventEmitter";
 import { connectRequestDecision, nearbyClickAction, nearbyOfferDecision } from "./policy";
 import { routePeerMessage } from "./router";
 import { SecureNearbyChannel } from "./SecureNearbyChannel";
+import { deriveSafetyWords } from "./safetyWords";
+import { commitHello, verifyHelloCommit } from "./helloCommit";
 
 export type NearbyState = "discovered" | "connecting" | "handshaking" | "secure" | "incompatible" | "mismatch" | "failed";
-export type NearbySnapshot = NearbyPeer & { state: NearbyState; error: string | null };
-type RecordPeer = { peer: NearbyPeer; pc: RTCPeerConnection; channel: RTCDataChannel | null; secureChannel: SecureNearbyChannel | null; sender: FileSender | null; receiver: FileReceiver | null; receiveReplay: NearbyReplayGuard; state: NearbyState; context: PeerCryptoContext | null; localNonce: Uint8Array | null; sentHello: boolean; receivedHello: boolean; receivedReady: boolean; pendingReady: string | null; requestTimes: number[]; offerTimes: number[]; pendingOfferIds: Set<number>; timeout: ReturnType<typeof setTimeout> | null };
-type Events = { peer: NearbySnapshot; dropped: { peerId: string; count: number }; offer: { peerId: string; transferId: number; alias: string; fingerprint: string; metadata: { name: string; size: number; mime: string; sha256: string; chunkSize: number; totalChunks: number } }; transfer: TransferSnapshot; invite: { peerId: string; payload: Extract<NearbyControlPayload, { type: "workspace-invite" }> }; inviteAck: { peerId: string; payload: Extract<NearbyControlPayload, { type: "invite-ack" }> } };
+export type NearbySnapshot = NearbyPeer & { state: NearbyState; error: string | null; safetyWords?: readonly string[] };
+type RecordPeer = { peer: NearbyPeer; pc: RTCPeerConnection; channel: RTCDataChannel | null; secureChannel: SecureNearbyChannel | null; sender: FileSender | null; receiver: FileReceiver | null; receiveReplay: NearbyReplayGuard; state: NearbyState; context: PeerCryptoContext | null; localNonce: Uint8Array | null; sentHello: boolean; sentCommit: boolean; receivedHello: boolean; receivedReady: boolean; pendingReady: string | null; localHello: string | null; remoteCommit: string | null; receivedCommit: boolean; requestTimes: number[]; offerTimes: number[]; textTimes: number[]; pendingOfferIds: Set<number>; timeout: ReturnType<typeof setTimeout> | null };
+type Events = { peer: NearbySnapshot; unreachable: { peerId: string }; dropped: { peerId: string; count: number }; offer: { peerId: string; transferId: number; alias: string; fingerprint: string; metadata: { name: string; size: number; mime: string; sha256: string; chunkSize: number; totalChunks: number } }; transfer: TransferSnapshot; text: { peerId: string; alias: string; fingerprint: string; payload: Extract<NearbyControlPayload, { type: "nearby-text" }> }; invite: { peerId: string; payload: Extract<NearbyControlPayload, { type: "workspace-invite" }> }; inviteAck: { peerId: string; payload: Extract<NearbyControlPayload, { type: "invite-ack" }> } };
 
 export class NearbyManager {
   readonly events = new TypedEventEmitter<Events>();
@@ -41,6 +43,7 @@ export class NearbyManager {
   cancelFile(peerId: string, transferId: number): void { const record = this.active.get(peerId); record?.sender?.cancel(transferId); record?.receiver?.cancel(transferId); }
   sendFile(peerId: string, file: File): boolean { const record = this.active.get(peerId); if (this.blocked.has(record?.peer.fingerprint ?? "") || record?.state !== "secure" || !record.sender) return false; record.sender.enqueue(file, this.newTransferId()); return true; }
   sendControl(peerId: string, payload: NearbyControlPayload): boolean { const record = this.active.get(peerId); if (this.blocked.has(record?.peer.fingerprint ?? "") || record?.state !== "secure" || !record.secureChannel) return false; record.secureChannel.sendNearbyControl(payload); return true; }
+  sendText(peerId: string, text: string): boolean { const record = this.active.get(peerId); if (!record || new TextEncoder().encode(text).byteLength > 4096) return false; record.textTimes = record.textTimes.filter((time) => Date.now() - time < 60_000); if (record.textTimes.length >= 10) return false; const parsed = nearbyTextPayloadSchema.safeParse({ type: "nearby-text", id: crypto.randomUUID(), text }); if (!parsed.success || !this.sendControl(peerId, parsed.data)) return false; record.textTimes.push(Date.now()); return true; }
   takeInvite(inviteId: string): Extract<NearbyControlPayload, { type: "workspace-invite" }> | null { const payload = this.invitePayloads.get(inviteId) ?? null; this.invitePayloads.delete(inviteId); return payload; }
   debugInject(peerId: string, type: "sync" | "manifest"): void { const channel = this.active.get(peerId)?.channel; if (channel?.readyState === "open") channel.send(JSON.stringify({ type })); }
   connect(peerId: string): void {
@@ -85,8 +88,8 @@ export class NearbyManager {
   private localId = "";
   private createRecord(peer: NearbyPeer): RecordPeer {
     const pc = new RTCPeerConnection({ iceServers: this.iceServers });
-    const record: RecordPeer = { peer, pc, channel: null, secureChannel: null, sender: null, receiver: null, receiveReplay: new NearbyReplayGuard(), state: "connecting", context: null, localNonce: null, sentHello: false, receivedHello: false, receivedReady: false, pendingReady: null, requestTimes: [], offerTimes: [], pendingOfferIds: new Set(), timeout: null };
-    this.active.set(peer.peerId, record); this.emit(peer, "connecting", null);
+    const record: RecordPeer = { peer, pc, channel: null, secureChannel: null, sender: null, receiver: null, receiveReplay: new NearbyReplayGuard(), state: "connecting", context: null, localNonce: null, sentHello: false, sentCommit: false, receivedHello: false, receivedReady: false, pendingReady: null, localHello: null, remoteCommit: null, receivedCommit: false, requestTimes: [], offerTimes: [], textTimes: [], pendingOfferIds: new Set(), timeout: null };
+    this.active.set(peer.peerId, record); this.emit(peer, "connecting", null); this.armOfferTimeout(peer);
     pc.onicecandidate = (event) => { if (event.candidate) this.send({ type: "nearby-signal", to: peer.peerId, data: { kind: "ice", candidate: event.candidate.toJSON() } }); };
     pc.ondatachannel = (event) => { if (event.channel.label === "zc-nearby") this.attachChannel(record, event.channel); };
     pc.onconnectionstatechange = () => { if (pc.connectionState === "failed" || pc.connectionState === "closed") this.fail(record, "Connection failed"); };
@@ -106,13 +109,28 @@ export class NearbyManager {
   private async startHello(record: RecordPeer): Promise<void> {
     if (record.sentHello || !record.channel || record.channel.readyState !== "open") return;
     record.localNonce = crypto.getRandomValues(new Uint8Array(32)); record.sentHello = true; record.state = "handshaking"; this.emit(record.peer, "handshaking", null);
-    record.channel.send(JSON.stringify({ type: "hello", v: 1, alg: this.identity.algorithm, publicKey: bytesToBase64(this.identity.publicKeyRaw), nonce: bytesToBase64(record.localNonce) }));
+    record.localHello = JSON.stringify({ type: "hello", v: 1, alg: this.identity.algorithm, publicKey: bytesToBase64(this.identity.publicKeyRaw), nonce: bytesToBase64(record.localNonce) });
+    if (record.timeout) clearTimeout(record.timeout);
+    record.timeout = setTimeout(() => this.fail(record, "Retry"), 10_000);
+    record.channel.send(JSON.stringify({ type: "hello-commit", c: await commitHello(record.localHello) }));
+    record.sentCommit = true;
+    if (record.receivedCommit) record.channel.send(record.localHello);
   }
   private async handleData(record: RecordPeer, raw: string): Promise<void> {
     let decoded: unknown; try { decoded = JSON.parse(raw) as unknown; } catch { return; }
     const routed = routePeerMessage("zc-nearby", decoded, () => this.events.emit("dropped", { peerId: record.peer.peerId, count: 1 }));
     if (!routed.accepted) return;
+    if (decoded && typeof decoded === "object" && "type" in decoded && decoded.type === "hello-commit") {
+      if (raw.length > 128 || record.receivedCommit || !("c" in decoded) || typeof decoded.c !== "string") return this.fail(record, "Handshake integrity");
+      const commitment = base64ToBytes(decoded.c);
+      if (commitment.length !== 32 || decoded.c.length > 128) return this.fail(record, "Handshake integrity");
+      record.receivedCommit = true; record.remoteCommit = decoded.c;
+      if (record.localHello && record.sentCommit && record.channel?.readyState === "open") record.channel.send(record.localHello);
+      return;
+    }
     if (decoded && typeof decoded === "object" && "type" in decoded && decoded.type === "hello") {
+      if (!record.receivedCommit || !record.remoteCommit || typeof raw !== "string") return this.fail(record, "Handshake integrity");
+      if (!await verifyHelloCommit(raw, record.remoteCommit)) return this.fail(record, "Handshake integrity");
       const parsed = helloMessageSchema.safeParse(decoded); if (!parsed.success || record.receivedHello) return this.fail(record, "Invalid hello");
       record.receivedHello = true; if (!record.sentHello) await this.startHello(record);
       const hello = parsed.data; if (hello.alg !== this.identity.algorithm) { record.state = "incompatible"; this.emit(record.peer, "incompatible", "Incompatible identity algorithm"); return; }
@@ -120,7 +138,7 @@ export class NearbyManager {
         const remoteNonce = base64ToBytes(hello.nonce), remotePublicKey = base64ToBytes(hello.publicKey);
         if (!record.localNonce || remoteNonce.length !== 32 || compareBytes(record.localNonce, remoteNonce) === 0) throw new Error("Invalid hello nonce");
         const fingerprint = await fingerprintPublicKey(remotePublicKey);
-        if (fingerprint !== record.peer.fingerprint) { record.state = "mismatch"; this.emit(record.peer, "mismatch", "Identity mismatch"); return; }
+        if (fingerprint !== record.peer.fingerprint) { record.state = "mismatch"; this.emit(record.peer, "mismatch", "Identity mismatch"); record.channel?.close(); return; }
         const sessionKey = await deriveSessionKey({ algorithm: hello.alg, privateKey: this.identity.privateKey, localPublicKey: this.identity.publicKeyRaw, remotePublicKey, localNonce: record.localNonce, remoteNonce });
         record.context = { sessionKey, localFingerprint: this.identity.fingerprint, remoteFingerprint: fingerprint, localNonce: record.localNonce, remoteNonce };
         const sealed = await seal(sessionKey, utf8(JSON.stringify({ type: "ready", v: 1 })), localToRemoteAad(record.context, "ready"));
@@ -150,7 +168,8 @@ export class NearbyManager {
       record.state = "secure";
       if (record.timeout) clearTimeout(record.timeout);
       this.setupTransfers(record);
-      this.emit(record.peer, "secure", null);
+      const words = await deriveSafetyWords(context.localFingerprint, context.remoteFingerprint, context.localNonce, context.remoteNonce);
+      this.emit(record.peer, "secure", null, words);
     } catch { this.fail(record, "Handshake confirmation failed"); }
   }
 
@@ -188,6 +207,7 @@ export class NearbyManager {
       this.events.emit("invite", { peerId: record.peer.peerId, payload });
       return;
     }
+    if (payload.type === "nearby-text") { record.textTimes = record.textTimes.filter((time) => Date.now() - time < 60_000); if (record.textTimes.length >= 10) { this.events.emit("dropped", { peerId: record.peer.peerId, count: 1 }); return; } record.textTimes.push(Date.now()); this.events.emit("text", { peerId: record.peer.peerId, alias: record.peer.alias, fingerprint: record.peer.fingerprint, payload }); return; }
     if (payload.type === "invite-ack") { this.events.emit("inviteAck", { peerId: record.peer.peerId, payload }); return; }
     if (payload.type === "nearby-file-offer") {
       const now = Date.now();
@@ -212,10 +232,10 @@ export class NearbyManager {
     const id = crypto.getRandomValues(new Uint32Array(1))[0] ?? 0;
     return id === 0 ? 1 : id;
   }
-  private armOfferTimeout(peer: NearbyPeer): void { const record = this.active.get(peer.peerId); if (!record) return; record.timeout = setTimeout(() => { if (record.state === "connecting") this.fail(record, "No offer received; retry"); }, 10_000); }
-  private fail(record: RecordPeer, error: string): void { if (record.timeout) clearTimeout(record.timeout); record.state = "failed"; this.emit(record.peer, "failed", error); }
+  private armOfferTimeout(peer: NearbyPeer): void { const record = this.active.get(peer.peerId); if (!record) return; if (record.timeout) clearTimeout(record.timeout); record.timeout = setTimeout(() => { if (record.state === "connecting") { this.fail(record, "No longer reachable"); this.remove(peer.peerId); this.events.emit("unreachable", { peerId: peer.peerId }); } }, 10_000); }
+  private fail(record: RecordPeer, error: string): void { if (record.state === "failed") return; if (record.timeout) clearTimeout(record.timeout); record.state = "failed"; this.emit(record.peer, "failed", error); record.channel?.close(); }
   private dispose(record: RecordPeer): void { if (record.timeout) clearTimeout(record.timeout); record.sender?.dispose(); record.receiver?.dispose(); record.pc.onicecandidate = null; record.pc.ondatachannel = null; record.pc.close(); }
-  private emit(peer: NearbyPeer, state: NearbyState, error: string | null): void { this.events.emit("peer", { ...peer, state, error }); }
+  private emit(peer: NearbyPeer, state: NearbyState, error: string | null, safetyWords?: readonly string[]): void { this.events.emit("peer", { ...peer, state, error, ...(safetyWords ? { safetyWords } : {}) }); }
 }
 
 function toFileControl(payload: NearbyControlPayload): FileControlMessage | null {

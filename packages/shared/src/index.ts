@@ -77,9 +77,10 @@ export const nearbyFileRejectSchema = z.object({ type: z.literal("nearby-file-re
 export const nearbyFileCompleteSchema = z.object({ type: z.literal("nearby-file-complete"), transferId: z.number().int().nonnegative().max(0xffffffff) }).strict();
 export const nearbyFileAckSchema = z.object({ type: z.literal("nearby-file-ack"), transferId: z.number().int().nonnegative().max(0xffffffff), ok: z.boolean(), reason: z.string().max(1000).optional() }).strict();
 export const nearbyFileCancelSchema = z.object({ type: z.literal("nearby-file-cancel"), transferId: z.number().int().nonnegative().max(0xffffffff), reason: z.string().max(1000).optional() }).strict();
+export const nearbyTextSchema = z.object({ type: z.literal("nearby-text"), id: z.string().uuid(), text: z.string().max(4096) }).strict();
 export const nearbyWorkspaceInviteSchema = z.object({ type: z.literal("workspace-invite"), inviteId: z.string().uuid(), secret: z.string().regex(/^[A-Za-z0-9_-]{43}$/), workspaceName: z.string().min(1).max(100), role: z.enum(["editor", "viewer"]), expiresAt: z.string().datetime() }).strict();
 export const nearbyInviteAckSchema = z.object({ type: z.literal("invite-ack"), inviteId: z.string().uuid(), declined: z.boolean() }).strict();
-export const nearbyControlPayloadSchema = z.discriminatedUnion("type", [nearbyFileOfferSchema, nearbyFileAcceptSchema, nearbyFileRejectSchema, nearbyFileCompleteSchema, nearbyFileAckSchema, nearbyFileCancelSchema, nearbyWorkspaceInviteSchema, nearbyInviteAckSchema]);
+export const nearbyControlPayloadSchema = z.discriminatedUnion("type", [nearbyFileOfferSchema, nearbyFileAcceptSchema, nearbyFileRejectSchema, nearbyFileCompleteSchema, nearbyFileAckSchema, nearbyFileCancelSchema, nearbyTextSchema, nearbyWorkspaceInviteSchema, nearbyInviteAckSchema]);
 export type NearbyControlPayload = z.infer<typeof nearbyControlPayloadSchema>;
 
 export const joinSchema = z.object({
@@ -102,9 +103,6 @@ export const clientMessageSchema = z.union([
   joinSchema,
   leaveSchema,
   relaySignalSchema,
-  nearbyEnableSchema,
-  nearbyDisableSchema,
-  nearbyRelaySchema,
 ]);
 
 export const joinedSchema = z.object({

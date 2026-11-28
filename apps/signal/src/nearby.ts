@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { isIP } from "node:net";
 
 export function normalizeClientIp(input: string): string {
@@ -55,4 +55,8 @@ export function deriveClientIp(xff: string | string[] | undefined, socketAddress
 
 export function withinWindow(timestamps: number[], now: number, windowMs: number): number[] {
   return timestamps.filter((time) => now - time < windowMs);
+}
+
+export function rawPublicKeyFingerprint(raw: Uint8Array): string {
+  return createHash("sha256").update(raw).digest("hex");
 }

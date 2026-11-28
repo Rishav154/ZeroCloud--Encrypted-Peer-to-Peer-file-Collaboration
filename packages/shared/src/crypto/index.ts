@@ -14,7 +14,7 @@ export { generateIdentityKeyPair, type IdentityKeyPair } from "./identity.js";
 export { deriveSessionKey } from "./handshake.js";
 export { buildAad, open, seal, type AadContext } from "./seal.js";
 export { AesGcmChunkTransform } from "./chunkCipher.js";
-export { buildNearbyAad, sealNearbyControl, openNearbyControl, NearbyReplayGuard, nearbyControlEnvelopeSchema, nearbyControlTypeSchema, MAX_NEARBY_CONTROL_BYTES, type NearbyAadContext, type NearbyControlEnvelope, type NearbyControlType } from "./nearby.js";
+export { buildNearbyAad, sealNearbyControl, openNearbyControl, NearbyReplayGuard, nearbyControlEnvelopeSchema, nearbyControlTypeSchema, nearbyTextPayloadSchema, MAX_NEARBY_CONTROL_BYTES, type NearbyAadContext, type NearbyControlEnvelope, type NearbyControlType } from "./nearby.js";
 export {
   generateWorkspaceKey,
   deriveWorkspaceSyncKey,

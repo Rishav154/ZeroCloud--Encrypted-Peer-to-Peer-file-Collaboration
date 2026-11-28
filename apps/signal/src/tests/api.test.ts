@@ -717,91 +717,26 @@ describe("workspace key rotation", () => {
 });
 
 describe("authenticated workspace signaling", () => {
-  it("isolates nearby groups and relays connect requests only within a group", async () => {
-    const hub = new WorkspaceHub(pool, jwtSecret, undefined, "test-nearby-secret-long-enough-for-hmac");
-    const client = apiClient();
-    const a = await register(client, "nearby-a@example.com");
-    const b = await register(client, "nearby-b@example.com");
-    const c = await register(client, "nearby-c@example.com");
-    let index = 0;
-    const addresses = ["198.51.100.7", "198.51.100.7", "203.0.113.9"];
+  it("rejects nearby messages on authenticated signaling", async () => {
+    const hub = new WorkspaceHub(pool, jwtSecret);
+    const account = await register(apiClient(), "nearby-disabled@example.com");
     const server = new WebSocketServer({ port: 0 });
-    server.on("connection", (socket) => hub.accept(socket, addresses[index++]));
+    server.on("connection", (socket) => hub.accept(socket));
     await once(server, "listening");
-    const sockets: WebSocket[] = [];
+    const socket = await openAuthenticatedSocket(server, account.body.accessToken as string);
+    const messages: unknown[] = [];
+    socket.on("message", (message) => messages.push(JSON.parse(message.toString()) as unknown));
     try {
-      const first = await openAuthenticatedSocket(server, a.body.accessToken as string); sockets.push(first);
-      const second = await openAuthenticatedSocket(server, b.body.accessToken as string); sockets.push(second);
-      const third = await openAuthenticatedSocket(server, c.body.accessToken as string); sockets.push(third);
-      const firstId = crypto.randomUUID(); const secondId = crypto.randomUUID(); const thirdId = crypto.randomUUID();
-      const firstList = nextSocketMessage(first, "nearby-peers");
-      const firstGroup = nextSocketMessage(first, "nearby-group-info");
-      first.send(JSON.stringify({ type: "nearby-enable", peerId: firstId, alias: "Bronze Locust" }));
-      expect((await firstList).type).toBe("nearby-peers"); await firstGroup;
-      const secondList = nextSocketMessage(second, "nearby-peers");
-      const secondGroup = nextSocketMessage(second, "nearby-group-info");
-      const joined = nextSocketMessage(first, "nearby-peer-joined");
-      second.send(JSON.stringify({ type: "nearby-enable", peerId: secondId, alias: "Quiet Heron" }));
-      const listed = await secondList; await secondGroup;
-      expect(listed.type === "nearby-peers" && listed.peers[0]?.fingerprint).toBe((a.body.user as { fingerprint: string }).fingerprint);
-      const peerJoin = await joined;
-      expect(peerJoin.type === "nearby-peer-joined" && peerJoin.peer.peerId).toBe(secondId);
-      expect(JSON.stringify(peerJoin)).not.toMatch(/userId|email|displayName/);
-      const thirdList = nextSocketMessage(third, "nearby-peers");
-      const thirdGroup = nextSocketMessage(third, "nearby-group-info");
-      third.send(JSON.stringify({ type: "nearby-enable", peerId: thirdId, alias: "Silver Comet" }));
-      const isolatedList = await thirdList; await thirdGroup;
-      expect(isolatedList.type === "nearby-peers" && isolatedList.peers).toEqual([]);
-      const signal = nextSocketMessage(first, "nearby-signal");
-      second.send(JSON.stringify({ type: "nearby-signal", to: firstId, data: { kind: "connect-request" } }));
-      const relayed = await signal;
-      expect(relayed.type === "nearby-signal" && relayed.from).toBe(secondId);
-      const isolated = nextSocketMessage(first, "nearby-peer-joined");
-      third.send(JSON.stringify({ type: "nearby-signal", to: firstId, data: { kind: "connect-request" } }));
-      expect((await nextSocketMessage(third, "error")).type).toBe("error");
-      await expect(isolated).rejects.toThrow("Timed out");
+      socket.send(JSON.stringify({ type: "nearby-enable", peerId: crypto.randomUUID(), alias: "Anonymous" }));
+      socket.send(JSON.stringify({ type: "nearby-disable" }));
+      socket.send(JSON.stringify({ type: "nearby-signal", to: crypto.randomUUID(), data: { kind: "connect-request" } }));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(messages.some((value) => typeof value === "object" && value !== null && "type" in value && String(value.type).startsWith("nearby-"))).toBe(false);
     } finally {
-      for (const socket of sockets) socket.close();
+      socket.close();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
-  }, 10_000);
-
-  it("enforces the three-socket cap and nearby per-socket rate limits", async () => {
-    const hub = new WorkspaceHub(pool, jwtSecret, undefined, "test-nearby-secret-long-enough-for-hmac");
-    const account = await register(apiClient(), "nearby-limits@example.com");
-    const server = new WebSocketServer({ port: 0 });
-    server.on("connection", (socket) => hub.accept(socket, "198.51.100.17"));
-    await once(server, "listening");
-    const sockets: WebSocket[] = [];
-    const peerIds: string[] = [];
-    try {
-      for (let index = 0; index < 4; index += 1) sockets.push(await openAuthenticatedSocket(server, account.body.accessToken as string));
-      for (let index = 0; index < 3; index += 1) {
-        const peerId = crypto.randomUUID(); peerIds.push(peerId);
-        const list = nextSocketMessage(sockets[index]!, "nearby-peers");
-        const group = nextSocketMessage(sockets[index]!, "nearby-group-info");
-        sockets[index]!.send(JSON.stringify({ type: "nearby-enable", peerId, alias: `Peer ${index + 1}` }));
-        await list; await group;
-      }
-      const capError = nextSocketMessage(sockets[3]!, "error");
-      sockets[3]!.send(JSON.stringify({ type: "nearby-enable", peerId: crypto.randomUUID(), alias: "Overflow" }));
-      const cap = await capError;
-      expect(cap.type === "error" && cap.code).toBe("GROUP_FULL");
-
-      const rateError = nextSocketMessage(sockets[3]!, "error");
-      for (let index = 0; index < 7; index += 1) sockets[3]!.send(JSON.stringify({ type: "nearby-disable" }));
-      const rate = await rateError;
-      expect(rate.type === "error" && rate.code).toBe("RATE_LIMITED");
-
-      const signalError = nextSocketMessage(sockets[0]!, "error");
-      for (let index = 0; index < 121; index += 1) sockets[0]!.send(JSON.stringify({ type: "nearby-signal", to: peerIds[1], data: { kind: "connect-request" } }));
-      const signalLimit = await signalError;
-      expect(signalLimit.type === "error" && signalLimit.code).toBe("RATE_LIMITED");
-    } finally {
-      for (const socket of sockets) socket.close();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
-  }, 12_000);
+  });
 
   it("closes sockets that do not authenticate within five seconds", async () => {
     const hub = new WorkspaceHub(pool, jwtSecret);

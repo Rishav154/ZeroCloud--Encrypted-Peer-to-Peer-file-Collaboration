@@ -11,6 +11,7 @@ describe("health endpoint", () => {
       { BUILD_SHA: "abc123", BUILD_TIME: "2026-11-01T00:00:00.000Z" },
       1000,
       () => 5000,
+      () => ({ sockets: 2, enabled: 1, groups: 1 }),
     ));
     const response = await request(app).get("/health");
     expect(response.status).toBe(200);
@@ -19,6 +20,7 @@ describe("health endpoint", () => {
       uptime: 4,
       db: "waking",
       build: { sha: "abc123", time: "2026-11-01T00:00:00.000Z" },
+      nearby: { sockets: 2, enabled: 1, groups: 1 },
     });
   });
 

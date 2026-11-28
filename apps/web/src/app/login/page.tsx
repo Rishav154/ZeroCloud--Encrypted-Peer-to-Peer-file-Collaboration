@@ -18,6 +18,7 @@ import {
   loginAccount,
 } from "../../lib/auth/api";
 import { useAuthStore } from "../../lib/auth/session";
+import { getPostAuthPath } from "../../lib/auth/returnPath";
 
 function fullFingerprint(fingerprint: string): string {
   return fingerprint.match(/.{1,4}/g)?.join(" ") ?? fingerprint;
@@ -51,7 +52,7 @@ export default function LoginPage() {
         identity,
       );
       setSession(session);
-      router.replace("/workspaces");
+      router.replace(getPostAuthPath());
     } catch (caught) {
       if (caught instanceof ApiError && caught.code === "IDENTITY_MISMATCH") {
         setError("This account is bound to a different device identity");

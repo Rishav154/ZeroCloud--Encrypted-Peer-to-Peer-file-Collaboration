@@ -2,7 +2,7 @@ import { z } from "zod";
 import { open, seal } from "./seal.js";
 import { base64ToBytes, bytesToBase64, concatBytes, utf8 } from "./encoding.js";
 
-export const nearbyControlTypeSchema = z.enum(["nearby-file-offer", "nearby-file-accept", "nearby-file-reject", "nearby-file-complete", "nearby-file-ack", "nearby-file-cancel", "workspace-invite", "invite-ack"]);
+export const nearbyControlTypeSchema = z.enum(["nearby-file-offer", "nearby-file-accept", "nearby-file-reject", "nearby-file-complete", "nearby-file-ack", "nearby-file-cancel", "nearby-text", "workspace-invite", "invite-ack"]);
 export const nearbyControlEnvelopeSchema = z.object({ type: z.literal("nearby-control"), v: z.literal(1), messageType: nearbyControlTypeSchema, seq: z.number().int().min(1).max(0xffffffff), sealed: z.string().min(1) }).strict();
 export const MAX_NEARBY_CONTROL_BYTES = 4 * 1024;
 
@@ -10,6 +10,7 @@ export type NearbyControlType = z.infer<typeof nearbyControlTypeSchema>;
 export type NearbyControlEnvelope = z.infer<typeof nearbyControlEnvelopeSchema>;
 
 export type NearbyAadContext = { messageType: NearbyControlType; senderFingerprint: string; receiverFingerprint: string; seq: number };
+export const nearbyTextPayloadSchema = z.object({ type: z.literal("nearby-text"), id: z.string().uuid(), text: z.string().max(4096) }).strict();
 
 export function buildNearbyAad(context: NearbyAadContext): Uint8Array {
   if (!Number.isInteger(context.seq) || context.seq < 1 || context.seq > 0xffffffff) throw new RangeError("Nearby sequence must be a positive uint32");

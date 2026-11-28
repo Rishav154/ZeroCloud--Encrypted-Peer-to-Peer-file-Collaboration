@@ -20,6 +20,8 @@ describe("NearbyManager connection requests", () => {
     expect(sent[0]?.data).toEqual({ kind: "connect-request" });
     vi.advanceTimersByTime(10_000);
     expect(states).toContain("failed");
+    expect(manager.connect(smaller)).toBeUndefined();
+    manager.updateDirectory([{ peerId: smaller, alias: "Bronze Locust", fingerprint: "a".repeat(64), keyAlg: "P-256" }]);
     manager.connect(smaller);
     expect(sent).toHaveLength(2);
     manager.disable();

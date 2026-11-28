@@ -15,7 +15,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   }, [hydrate, ready]);
 
   useEffect(() => {
-    if (ready && !accessToken) router.replace("/login");
+    if (ready && !accessToken) router.replace("/login?returnTo=%2Fworkspaces");
   }, [accessToken, ready, router]);
 
   if (!ready || !accessToken) {
