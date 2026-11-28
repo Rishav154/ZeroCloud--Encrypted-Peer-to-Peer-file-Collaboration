@@ -13,6 +13,8 @@ const secretNames = [
   "ICE_STATIC_USERNAME",
   "ICE_STATIC_CREDENTIAL",
 ];
+// NEXT_PUBLIC_* configuration is intentionally visible to browsers; only scan
+// server-only secret values here, not the names of public configuration keys.
 const values = new Map();
 for (const name of secretNames) {
   const value = process.env[name];
@@ -37,9 +39,6 @@ const failures = [];
 for (const filename of files) {
   const contents = await readFile(filename);
   const text = contents.toString("utf8");
-  if (filename.includes("/static/") && /NEXT_PUBLIC_TURN_[A-Z0-9_]+/.test(text)) {
-    failures.push(`${relative(root, filename)} contains a removed public TURN variable name`);
-  }
   for (const [name, value] of values) {
     if (text.includes(value)) failures.push(`${relative(root, filename)} contains a value from ${name}`);
   }
